@@ -52,7 +52,10 @@ def get_user_id() -> str:
     return USER_ID
 
 
-def prepare_history(user_key: str, limit: int = 10) -> list[Union[HumanMessage, AIMessage, SystemMessage]]:
+def prepare_history(
+    user_key: str,
+    limit: Optional[int] = None,
+) -> list[Union[HumanMessage, AIMessage, SystemMessage]]:
     history = agent.get_conversation_history(user_key, limit=limit)
     if not history:
         return [SystemMessage(content=agent.system_prompt)]
@@ -62,7 +65,7 @@ def prepare_history(user_key: str, limit: int = 10) -> list[Union[HumanMessage, 
 
 
 async def send_startup_greeting(channel, user_key: str):
-    history = prepare_history(user_key, limit=10)
+    history = prepare_history(user_key)
     agent.conversation_history[user_key] = history
 
     new_session_prompt = (
@@ -85,7 +88,7 @@ async def handle_user_message(message):
         return
 
     user_key = get_message_user_key(message)
-    history = prepare_history(user_key, limit=10)
+    history = prepare_history(user_key)
     agent.conversation_history[user_key] = history
 
     reply_text = await agent.generate_reply(history, prompt)
@@ -114,6 +117,7 @@ async def on_ready():
             "**I am Angela, an AI. I am your assistant, your secretary, and someone to whom you can talk. "
             "I hope I can help make your time here a little more comfortable.**"
         )
+        await channel.send("**...**")
         await send_startup_greeting(channel, get_user_id())
 
 

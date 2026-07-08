@@ -3,7 +3,7 @@ import os
 import asyncio
 
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from typing import List, Union, Dict, Optional, Tuple
+from typing import List, Union, Dict, Optional
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 import psycopg2
 from dotenv import load_dotenv
@@ -101,33 +101,31 @@ class AIAgent:
             # """)
             self.db_connection.commit()
 
-    def get_conversation_history(self, session_id: str, limit: int = 5) -> List[Union[HumanMessage, AIMessage, SystemMessage]]:
+    def get_conversation_history(
+        self,
+        session_id: str,
+        limit: Optional[int] = None,
+    ) -> List[Union[HumanMessage, AIMessage, SystemMessage]]:
         """Retrieve conversation history for context"""
         with self.db_connection.cursor() as cursor:
-            cursor.execute("""
-                SELECT user_message, agent_response 
-                FROM conversations 
-                WHERE session_id = %s 
-                ORDER BY created_at DESC 
-                LIMIT %s
-            """, (session_id, limit))
+            query = """
+                SELECT user_message, agent_response
+                FROM conversations
+                WHERE session_id = %s
+                ORDER BY created_at DESC
+            """
+            params = [session_id]
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(limit)
+
+            cursor.execute(query, params)
             rows = cursor.fetchall()
             history = []
             for user_msg, agent_resp in reversed(rows):
                 history.append(HumanMessage(content=user_msg))
                 history.append(AIMessage(content=agent_resp))
             return history
-
-    def get_latest_conversation(self, limit: int = 1) -> List[Tuple[str, str, str]]:
-        """Retrieve the most recent conversations for a startup summary."""
-        with self.db_connection.cursor() as cursor:
-            cursor.execute("""
-                SELECT session_id, user_message, agent_response
-                FROM conversations
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (limit,))
-            return cursor.fetchall()
         
     async def generate_reply(self, history: List[Union[HumanMessage, AIMessage, SystemMessage]], prompt: str) -> str:
         if not prompt or not prompt.strip():
