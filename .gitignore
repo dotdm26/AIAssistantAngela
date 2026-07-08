@@ -2,3 +2,7 @@
 notes.txt
 diary.txt
 creds.json
+test.py
+.venv/
+path/
+__pycache__/
