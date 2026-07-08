@@ -3,7 +3,7 @@ import os
 import asyncio
 
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from typing import List, Union, Dict, Optional
+from typing import List, Union, Dict, Optional, Tuple
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 import psycopg2
 from dotenv import load_dotenv
@@ -117,6 +117,17 @@ class AIAgent:
                 history.append(HumanMessage(content=user_msg))
                 history.append(AIMessage(content=agent_resp))
             return history
+
+    def get_latest_conversation(self, limit: int = 1) -> List[Tuple[str, str, str]]:
+        """Retrieve the most recent conversations for a startup summary."""
+        with self.db_connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT session_id, user_message, agent_response
+                FROM conversations
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (limit,))
+            return cursor.fetchall()
         
     async def generate_reply(self, history: List[Union[HumanMessage, AIMessage, SystemMessage]], prompt: str) -> str:
         if not prompt or not prompt.strip():
