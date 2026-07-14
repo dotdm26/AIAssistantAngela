@@ -1,6 +1,7 @@
 import hashlib
 import os
 import asyncio
+import re
 
 # Avoid HF Xet/CAS path issues in some environments (401 Unauthorized on public repos).
 #os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -14,8 +15,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("FALLBACK_GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.getenv("TEST_KEY")
 LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
+HYBRID_TOP_K = max(1, int(os.getenv("HYBRID_TOP_K", "3")))
+HYBRID_MIN_PROMPT_CHARS = max(1, int(os.getenv("HYBRID_MIN_PROMPT_CHARS", "24")))
+HYBRID_EXCLUDE_RECENT_COUNT = max(0, int(os.getenv("HISTORY_LIMIT", "10")))
 
 #avoid sending empty messages to the LLM, which can cause errors
 def _extract_text(content):
@@ -64,6 +68,7 @@ class AIAgent:
         self._enable_pgvector()
         self.create_tables()
         self._ensure_embedding_column()
+        self._ensure_text_search_column()
         
         # Agent configuration
         self.system_prompt = """ You are Angela, a highly-advanced Artificial Intelligence whose roles include being a secretary, an assistant, and a companion.
@@ -113,9 +118,21 @@ class AIAgent:
                     agent_response TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     metadata JSONB,
-                    embedding vector({self.embedding_dim})
+                    embedding vector({self.embedding_dim}),
+                    search_vector tsvector GENERATED ALWAYS AS (
+                        to_tsvector(
+                            'english',
+                            coalesce(user_message, '') || ' ' || coalesce(agent_response, '')
+                        )
+                    ) STORED
                 )
             """)
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS conversations_search_vector_idx
+                ON conversations USING GIN (search_vector)
+                """
+            )
             self.db_connection.commit()
 
     def _detect_embedding_dimension(self) -> int:
@@ -175,6 +192,158 @@ class AIAgent:
                 "dimension. New inserts will fail until this is resolved."
             )
 
+    def _ensure_text_search_column(self):
+        """Ensure the generated tsvector column and GIN index exist for full-text search."""
+        with self.db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'conversations'
+                  AND column_name = 'search_vector'
+                """
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    """
+                    ALTER TABLE conversations
+                    ADD COLUMN search_vector tsvector GENERATED ALWAYS AS (
+                        to_tsvector(
+                            'english',
+                            coalesce(user_message, '') || ' ' || coalesce(agent_response, '')
+                        )
+                    ) STORED
+                    """
+                )
+
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS conversations_search_vector_idx
+                ON conversations USING GIN (search_vector)
+                """
+            )
+            self.db_connection.commit()
+
+    async def hybrid_search_conversations(self, query: str, session_id: str, limit: int = 5):
+        """Combine PostgreSQL full-text search and vector similarity for retrieval."""
+        embedding = await self.generate_embedding(query)
+        vector_literal = "[" + ",".join(str(float(x)) for x in embedding) + "]"
+
+        with self.db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH recent_ids AS (
+                    SELECT id
+                    FROM conversations
+                    WHERE session_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                ),
+                ts_query AS (
+                    SELECT websearch_to_tsquery('english', %s) AS query
+                ),
+                text_candidates AS (
+                    SELECT
+                        id,
+                        user_message,
+                        agent_response,
+                        ts_rank_cd(search_vector, ts_query.query) AS text_rank,
+                        0::float AS semantic_score
+                    FROM conversations, ts_query
+                    WHERE session_id = %s
+                                            AND id NOT IN (SELECT id FROM recent_ids)
+                      AND search_vector @@ ts_query.query
+                    ORDER BY text_rank DESC
+                    LIMIT %s
+                ),
+                semantic_candidates AS (
+                    SELECT
+                        id,
+                        user_message,
+                        agent_response,
+                        0::float AS text_rank,
+                        1 - (embedding <=> %s::vector) AS semantic_score
+                    FROM conversations
+                    WHERE session_id = %s
+                                            AND id NOT IN (SELECT id FROM recent_ids)
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                ),
+                combined AS (
+                    SELECT * FROM text_candidates
+                    UNION ALL
+                    SELECT * FROM semantic_candidates
+                ),
+                deduped AS (
+                    SELECT
+                        id,
+                        max(user_message) AS user_message,
+                        max(agent_response) AS agent_response,
+                        max(text_rank) AS text_rank,
+                        max(semantic_score) AS semantic_score
+                    FROM combined
+                    GROUP BY id
+                )
+                SELECT
+                    user_message,
+                    agent_response,
+                    text_rank,
+                    semantic_score,
+                    (0.35 * text_rank) + (0.65 * semantic_score) AS hybrid_score
+                FROM deduped
+                ORDER BY hybrid_score DESC
+                LIMIT %s
+                """,
+                (
+                    session_id,
+                    HYBRID_EXCLUDE_RECENT_COUNT,
+                    query,
+                    session_id,
+                    limit,
+                    vector_literal,
+                    session_id,
+                    vector_literal,
+                    limit,
+                    limit,
+                ),
+            )
+            return cursor.fetchall()
+
+    def _format_hybrid_context(self, results) -> str:
+        if not results:
+            return ""
+
+        lines = ["Relevant past conversations:"]
+        for user_message, agent_response, text_rank, semantic_score, hybrid_score in results:
+            user_text = _extract_text(user_message)
+            agent_text = _extract_text(agent_response)
+            lines.append(
+                f"- User: {user_text}\n  Assistant: {agent_text}\n  Scores: text={text_rank:.3f}, semantic={semantic_score:.3f}, hybrid={hybrid_score:.3f}"
+            )
+
+        return "\n".join(lines)
+
+    def _should_use_hybrid_search(self, prompt: str) -> bool:
+        text = _extract_text(prompt).lower()
+        if len(text) >= HYBRID_MIN_PROMPT_CHARS:
+            return True
+
+        # For short prompts, only retrieve when the user implies memory/reference intent.
+        return bool(
+            re.search(
+                r"\b(remind|remember|earlier|previous|before|last time|you said|we said|continue|recap|summary|what did i)\b",
+                text,
+            )
+        )
+
+    def _estimate_token_count(self, messages: List[Union[HumanMessage, AIMessage, SystemMessage]]) -> int:
+        # Fast approximation for observability: ~4 chars per token for English-heavy text.
+        total_chars = 0
+        for message in messages:
+            total_chars += len(_extract_text(getattr(message, "content", "")))
+        return max(1, total_chars // 4)
+
     def get_conversation_history(
         self,
         session_id: str,
@@ -201,12 +370,27 @@ class AIAgent:
                 history.append(AIMessage(content=agent_resp))
             return history
         
-    async def generate_reply(self, history: List[Union[HumanMessage, AIMessage, SystemMessage]], prompt: str) -> str:
+    async def generate_reply(
+        self,
+        history: List[Union[HumanMessage, AIMessage, SystemMessage]],
+        prompt: str,
+        session_id: Optional[str] = None,
+    ) -> str:
         if not prompt or not prompt.strip():
             raise ValueError("Empty prompt")
 
-        # Knowledge lookup is disabled for now
-        messages = list(history) + [HumanMessage(content=prompt)]
+        messages = list(history)
+
+        retrieval_context = ""
+        if session_id and self._should_use_hybrid_search(prompt):
+            try:
+                related_conversations = await self.hybrid_search_conversations(prompt, session_id, limit=HYBRID_TOP_K)
+                retrieval_context = self._format_hybrid_context(related_conversations)
+                messages.append(SystemMessage(content=retrieval_context))
+            except Exception as exc:
+                print(f"Hybrid search failed: {exc}")
+
+        messages.append(HumanMessage(content=prompt))
         sanitized_messages = []
         for message in messages:
             content = getattr(message, "content", None)
@@ -214,15 +398,32 @@ class AIAgent:
             if text:
                 sanitized_messages.append(message)
 
+        estimated_input_tokens = self._estimate_token_count(sanitized_messages)
+        print(
+            f"[token_estimate] input~{estimated_input_tokens} tokens | "
+            f"messages={len(sanitized_messages)} | hybrid_used={bool(retrieval_context)}"
+        )
+
         if hasattr(self.llm, "ainvoke"):
             response = await self.llm.ainvoke(sanitized_messages)
         else:
             response = await asyncio.to_thread(self.llm.invoke, sanitized_messages)
 
-        if hasattr(response, "content"):
-            return _extract_text(response.content)
+        if hasattr(response, "usage_metadata"):
+            print(f"[token_usage] {response.usage_metadata}")
+        elif hasattr(response, "response_metadata"):
+            usage = getattr(response, "response_metadata", {}).get("usage_metadata")
+            if usage:
+                print(f"[token_usage] {usage}")
 
-        return _extract_text(response)
+        if hasattr(response, "content"):
+            output = _extract_text(response.content)
+            print(f"[token_estimate] output~{max(1, len(output) // 4)} tokens")
+            return output
+
+        output = _extract_text(response)
+        print(f"[token_estimate] output~{max(1, len(output) // 4)} tokens")
+        return output
     
     async def generate_embedding(self, text: str):
         """Generate an embedding for the given text."""

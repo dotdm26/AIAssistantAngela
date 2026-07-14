@@ -2,28 +2,29 @@ import os
 import asyncio
 import discord
 from dotenv import load_dotenv
+from pydantic_settings import BaseSettings
 from typing import Optional, Union
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from agent import AIAgent
 
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
-USER_ID = os.getenv("USER_ID")
+class Settings(BaseSettings):
+    DISCORD_TOKEN: str
+    DISCORD_CHANNEL_ID: Optional[str] = None
+    USER_ID: Optional[str] = None
 
-# Initialize AI agent
+settings = Settings()
 agent = AIAgent()
+HISTORY_LIMIT = max(1, int(os.getenv("HISTORY_LIMIT", "10")))
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-
 def get_allowed_values() -> set[str]:
     allowed_values = {os.getenv("user1"), os.getenv("user2")}
     return {value for value in allowed_values if value}
-
 
 def is_allowed_user(author) -> bool:
     allowed_values = get_allowed_values()
@@ -36,37 +37,25 @@ def is_allowed_user(author) -> bool:
         or author.global_name in allowed_values
     )
 
-
-def trim_for_discord(text: str, limit: int = 1900) -> str:
+def trim_for_discord(text: str, limit: int = 1990) -> str:
     if not text:
         return ""
     if len(text) <= limit:
         return text
     return text[:limit - 3] + "..."
 
-
-def get_message_user_key(message) -> str:
-    return str(message.author.id)
-
-
-def get_user_id() -> str:
-    return USER_ID
-
-
 def _log_store_conversation_error(task: asyncio.Task):
     exc = task.exception()
     if exc:
         print(f"Failed to store conversation in background: {exc}")
 
-
 def schedule_store_conversation(user_key: str, user_message: str, agent_response: str):
     task = asyncio.create_task(agent.store_conversation(user_key, user_message, agent_response))
     task.add_done_callback(_log_store_conversation_error)
 
-
 def prepare_history(
     user_key: str,
-    limit: Optional[int] = None,
+    limit: Optional[int] = HISTORY_LIMIT,
 ) -> list[Union[HumanMessage, AIMessage, SystemMessage]]:
     history = agent.get_conversation_history(user_key, limit=limit)
     if not history:
@@ -75,7 +64,6 @@ def prepare_history(
     history.insert(0, SystemMessage(content=agent.system_prompt))
     return history
 
-
 async def send_startup_greeting(channel, user_key: str):
     history = prepare_history(user_key)
     agent.conversation_history[user_key] = history
@@ -83,27 +71,26 @@ async def send_startup_greeting(channel, user_key: str):
     new_session_prompt = (
         "Greet the user, and if useful, briefly mention a topic in one of your previous conversations."
     )
-    greeting_text = await agent.generate_reply(history, new_session_prompt)
+    greeting_text = await agent.generate_reply(history, new_session_prompt, session_id=user_key)
     if not greeting_text:
         await channel.send("Sorry, I didn't get a usable reply from the model.")
         return
 
     safe_reply = trim_for_discord(greeting_text)
-    history.extend([AIMessage(content=greeting_text)])
     await channel.send(safe_reply)
+    history.extend([AIMessage(content=greeting_text)])
     schedule_store_conversation(user_key, new_session_prompt, greeting_text)
-
 
 async def handle_user_message(message):
     prompt = message.content
     if not prompt or not prompt.strip():
         return
 
-    user_key = get_message_user_key(message)
+    user_key = str(message.author.id)
     history = prepare_history(user_key)
     agent.conversation_history[user_key] = history
 
-    reply_text = await agent.generate_reply(history, prompt)
+    reply_text = await agent.generate_reply(history, prompt, session_id=user_key)
     if not reply_text:
         await message.channel.send("Sorry, I didn't get a usable reply from the model.")
         return
@@ -118,11 +105,11 @@ async def handle_user_message(message):
 async def on_ready():
     print(f"We have logged in as {client.user}")
 
-    if not DISCORD_CHANNEL_ID:
+    if not settings.DISCORD_CHANNEL_ID:
         print("DISCORD_CHANNEL_ID is not set. Startup greeting skipped.")
         return
 
-    channel = client.get_channel(int(DISCORD_CHANNEL_ID))
+    channel = client.get_channel(int(settings.DISCORD_CHANNEL_ID))
     if channel:
         await channel.send("```STARTING UP...```")
         await channel.send(
@@ -130,8 +117,7 @@ async def on_ready():
             "I hope I can help make your time here a little more comfortable.**"
         )
         await channel.send("**...**")
-        await send_startup_greeting(channel, get_user_id())
-
+        await send_startup_greeting(channel, settings.USER_ID)
 
 @client.event
 async def on_message(message):
@@ -150,7 +136,6 @@ async def on_message(message):
                 "The AI service is currently rate-limited or out of quota. Please try again shortly."
             )
         else:
-            await message.channel.send("Sorry, I hit an error while responding.")
+            await message.channel.send("Sorry, I hit an error while responding. ERROR: " + str(exc))
 
-
-client.run(DISCORD_TOKEN)
+client.run(settings.DISCORD_TOKEN)
