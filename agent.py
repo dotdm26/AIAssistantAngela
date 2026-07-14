@@ -2,7 +2,11 @@ import hashlib
 import os
 import asyncio
 
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+# Avoid HF Xet/CAS path issues in some environments (401 Unauthorized on public repos).
+#os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from sentence_transformers import SentenceTransformer
 from typing import List, Union, Dict, Optional
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 import psycopg2
@@ -10,7 +14,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.getenv("FALLBACK_GOOGLE_API_KEY")
+LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 
 #avoid sending empty messages to the LLM, which can cause errors
 def _extract_text(content):
@@ -27,16 +32,38 @@ def _extract_text(content):
     return str(content).strip()
 
 
+class LocalNomicEmbeddings:
+    """Local embedding adapter with the same interface used by the agent."""
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name, trust_remote_code=True)
+
+    def embed_query(self, text: str) -> List[float]:
+        # Nomic v1.5 expects task prefixing for best retrieval quality.
+        encoded = self.model.encode(
+            f"search_document: {text}",
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+        return encoded.tolist()
+
+    async def aembed_query(self, text: str) -> List[float]:
+        return await asyncio.to_thread(self.embed_query, text)
+
+
 class AIAgent:
     def __init__(self):
         self.llm = ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model="gemini-3.1-flash-lite")
-        self.embeddings = GoogleGenerativeAIEmbeddings(api_key=GOOGLE_API_KEY, model="gemini-embedding-001")
+        self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
+        self.embedding_dim = self._detect_embedding_dimension()
         self.conversation_history = {}
 
         # Database connection
         self.db_connection = psycopg2.connect(os.getenv("DATABASE_URL"))
         self._enable_pgvector()
         self.create_tables()
+        self._ensure_embedding_column()
         
         # Agent configuration
         self.system_prompt = """ You are Angela, a highly-advanced Artificial Intelligence whose roles include being a secretary, an assistant, and a companion.
@@ -78,28 +105,75 @@ class AIAgent:
     def create_tables(self):
         """Ensure required tables exist"""
         with self.db_connection.cursor() as cursor:
-            cursor.execute("""
+            cursor.execute(f"""
                 CREATE TABLE IF NOT EXISTS conversations (
                     id SERIAL PRIMARY KEY,
                     session_id VARCHAR(255) NOT NULL,
                     user_message TEXT,
                     agent_response TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    metadata JSONB
+                    metadata JSONB,
+                    embedding vector({self.embedding_dim})
                 )
             """)
-            # agent_knowledge table is currently disabled
-            # cursor.execute("""
-            #     CREATE TABLE IF NOT EXISTS agent_knowledge (
-            #         id SERIAL PRIMARY KEY,
-            #         key VARCHAR(255) NOT NULL UNIQUE,
-            #         value TEXT,
-            #         embedding vector(768),
-            #         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            #         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            #     )
-            # """)
             self.db_connection.commit()
+
+    def _detect_embedding_dimension(self) -> int:
+        """Query the embeddings model once to learn its vector size."""
+        sample_text = "Detect embedding dimension."
+        if hasattr(self.embeddings, "embed_query"):
+            embedding = self.embeddings.embed_query(sample_text)
+        else:
+            embedding = asyncio.run(self.embeddings.aembed_query(sample_text))
+        return len(embedding)
+
+    def _get_embedding_column_info(self, cursor) -> Optional[str]:
+        cursor.execute(
+            """
+            SELECT pg_catalog.format_type(att.atttypid, att.atttypmod) AS type_name
+            FROM pg_catalog.pg_attribute att
+            JOIN pg_catalog.pg_class cls ON att.attrelid = cls.oid
+            JOIN pg_catalog.pg_namespace ns ON cls.relnamespace = ns.oid
+            WHERE ns.nspname = 'public'
+              AND cls.relname = 'conversations'
+              AND att.attname = 'embedding'
+              AND att.attnum > 0
+            """
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def _ensure_embedding_column(self):
+        """Verify the conversations.embedding column matches the active model's dimension.
+
+        Does not modify or delete existing data automatically. If there is a
+        mismatch and rows already have embeddings stored, this only warns.
+        """
+        with self.db_connection.cursor() as cursor:
+            column_info = self._get_embedding_column_info(cursor)
+            if not column_info:
+                cursor.execute(f"ALTER TABLE conversations ADD COLUMN embedding vector({self.embedding_dim});")
+                self.db_connection.commit()
+                return
+
+            import re
+            match = re.search(r"vector\((\d+)\)", column_info)
+            if not match:
+                print(f"Warning: embedding column has unexpected type '{column_info}'; skipping dimension check.")
+                return
+
+            current_dim = int(match.group(1))
+            if current_dim == self.embedding_dim:
+                return
+
+            cursor.execute("SELECT COUNT(*) FROM conversations WHERE embedding IS NOT NULL;")
+            non_null_count = cursor.fetchone()[0]
+            print(
+                f"WARNING: conversations.embedding is vector({current_dim}), but the active "
+                f"embeddings model ('{LOCAL_EMBEDDING_MODEL}') returns vector({self.embedding_dim}). "
+                f"{non_null_count} existing row(s) already have embeddings stored in the old "
+                "dimension. New inserts will fail until this is resolved."
+            )
 
     def get_conversation_history(
         self,
@@ -150,158 +224,26 @@ class AIAgent:
 
         return _extract_text(response)
     
-    def store_conversation(self, session_id: str, user_message: str, agent_response: str):
-        """Store a conversation in the database"""
+    async def generate_embedding(self, text: str):
+        """Generate an embedding for the given text."""
+        if hasattr(self.embeddings, "aembed_query"):
+            return await self.embeddings.aembed_query(text)
+        return await asyncio.to_thread(self.embeddings.embed_query, text)
+
+    def _save_conversation(self, session_id: str, user_message: str, agent_response: str, embedding):
         with self.db_connection.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO conversations (session_id, user_message, agent_response)
-                VALUES (%s, %s, %s)
-            """, (session_id, user_message, agent_response))
+                INSERT INTO conversations (session_id, user_message, agent_response, embedding)
+                VALUES (%s, %s, %s, %s)
+            """, (session_id, user_message, agent_response, embedding))
             self.db_connection.commit()
 
-    # Knowledge storage and retrieval is currently disabled.
-    # async def decide_knowledge_to_store(
-    #     self, prompt: str, response: str
-    # ) -> Optional[Tuple[str, str]]:
-    #     """Ask the LLM whether this conversation should be stored as knowledge."""
-    #     decision_instructions = (
-    #         "You are a knowledge curator. Review the user prompt and the assistant reply below. "
-    #         "If this exchange contains information about the user, any useful fact, preference, habit, or long-term context that should be stored in the agent's knowledge base, "
-    #         "respond with exactly two lines in this format:\n"
-    #         "KEY: <short unique identifier>\n"
-    #         "VALUE: <concise summary of the knowledge>\n"
-    #     )
+    async def store_conversation(self, session_id: str, user_message: str, agent_response: str):
+        """Store a conversation in the database, including its embedding for semantic search."""
+        combined_text = f"{user_message}\n\n{agent_response}"
+        embedding = await self.generate_embedding(combined_text)
+        await asyncio.to_thread(self._save_conversation, session_id, user_message, agent_response, embedding)
 
-    #     messages = [
-    #         SystemMessage(content=decision_instructions),
-    #         HumanMessage(content=f"User: {prompt}\nAssistant: {response}"),
-    #     ]
-
-    #     if hasattr(self.llm, "ainvoke"):
-    #         decision_result = await self.llm.ainvoke(messages)
-    #     else:
-    #         decision_result = await asyncio.to_thread(self.llm.invoke, messages)
-
-    #     content = _extract_text(getattr(decision_result, "content", decision_result))
-    #     if not content:
-    #         return None
-
-    #     if content.strip().upper().startswith("NO"):
-    #         return None
-
-    #     lines = [line.strip() for line in content.splitlines() if line.strip()]
-    #     key = None
-    #     value = None
-    #     for line in lines:
-    #         if line.upper().startswith("KEY:"):
-    #             key = line.split(":", 1)[1].strip()
-    #         elif line.upper().startswith("VALUE:"):
-    #             value = line.split(":", 1)[1].strip()
-
-    #     if not key and value:
-    #         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-    #         key = f"knowledge_{digest}"
-
-    #     if not key or not value:
-    #         return None
-
-    #     return key, value
-
-    # async def maybe_add_knowledge(self, prompt: str, response: str) -> bool:
-    #     """Optionally add knowledge if the LLM decides it is worth storing."""
-    #     decision = await self.decide_knowledge_to_store(prompt, response)
-    #     if not decision:
-    #         return False
-
-    #     key, value = decision
-    #     await asyncio.to_thread(self.add_knowledge, key, value)
-    #     return True
-
-    # def add_knowledge(self, key: str, value: str):
-    #     """Add knowledge to the agent's database with embeddings"""
-    #     try:
-    #         # Generate embedding for the value
-    #         embedding = self.embeddings.embed_query(value)
-    #     except Exception as e:
-    #         print(f"Error generating embedding: {e}")
-    #         embedding = None
-        
-    #     with self.db_connection.cursor() as cursor:
-    #         cursor.execute("""
-    #             SELECT id FROM agent_knowledge WHERE key = %s
-    #         """, (key,))
-    #         exists = cursor.fetchone()
-            
-    #         if exists:
-    #             # Update existing knowledge
-    #             if embedding:
-    #                 cursor.execute("""
-    #                     UPDATE agent_knowledge 
-    #                     SET value = %s, embedding = %s::vector, updated_at = CURRENT_TIMESTAMP
-    #                     WHERE key = %s
-    #                 """, (value, embedding, key))
-    #             else:
-    #                 cursor.execute("""
-    #                     UPDATE agent_knowledge 
-    #                     SET value = %s, updated_at = CURRENT_TIMESTAMP
-    #                     WHERE key = %s
-    #                 """, (value, key))
-    #         else:
-    #             # Insert new knowledge
-    #             if embedding:
-    #                 cursor.execute("""
-    #                     INSERT INTO agent_knowledge (key, value, embedding)
-    #                     VALUES (%s, %s, %s::vector)
-    #                 """, (key, value, embedding))
-    #             else:
-    #                 cursor.execute("""
-    #                     INSERT INTO agent_knowledge (key, value)
-    #                     VALUES (%s, %s)
-    #                 """, (key, value))
-    #         self.db_connection.commit()
-    # 
-    # async def query_knowledge(self, query: str, similarity_threshold: float = 0.5, limit: int = 3) -> Optional[str]:
-    #     """Query the agent's knowledge base using semantic similarity"""
-    #     try:
-    #         # Generate embedding for the query
-    #         if hasattr(self.embeddings, "aembed_query"):
-    #             query_embedding = await self.embeddings.aembed_query(query)
-    #         else:
-    #             query_embedding = await asyncio.to_thread(self.embeddings.embed_query, query)
-            
-    #         with self.db_connection.cursor() as cursor:
-    #             # Try vector similarity search with pgvector
-    #             cursor.execute("""
-    #                 SELECT value, 1 - (embedding <=> %s::vector) as similarity
-    #                 FROM agent_knowledge
-    #                 WHERE embedding IS NOT NULL
-    #                 ORDER BY similarity DESC
-    #                 LIMIT %s
-    #             """, (query_embedding, limit))
-    #             results = cursor.fetchall()
-                
-    #             if results and results[0][1] >= similarity_threshold:
-    #                 # Format results as context for the LLM
-    #                 context = "\n\n".join([result[0] for result in results])
-    #                 return context
-                
-    #             # Fallback to keyword search if no results
-    #             cursor.execute("""
-    #                 SELECT value
-    #                 FROM agent_knowledge
-    #                 WHERE key ILIKE %s OR value ILIKE %s
-    #                 LIMIT 1
-    #             """, (f"%{query}%", f"%{query}%"))
-    #             result = cursor.fetchone()
-                
-    #             if result:
-    #                 return result[0]
-                
-    #             return None
-    #     except Exception as e:
-    #         print(f"Error querying knowledge: {e}")
-    #         return None
-    
     def close(self):
         """Clean up resources"""
         self.db_connection.close()

@@ -3,6 +3,7 @@ notes.txt
 diary.txt
 creds.json
 test.py
+tools/
 .venv/
 path/
 __pycache__/
