@@ -1,4 +1,5 @@
 import os
+import asyncio
 import discord
 from dotenv import load_dotenv
 from typing import Optional, Union
@@ -52,6 +53,17 @@ def get_user_id() -> str:
     return USER_ID
 
 
+def _log_store_conversation_error(task: asyncio.Task):
+    exc = task.exception()
+    if exc:
+        print(f"Failed to store conversation in background: {exc}")
+
+
+def schedule_store_conversation(user_key: str, user_message: str, agent_response: str):
+    task = asyncio.create_task(agent.store_conversation(user_key, user_message, agent_response))
+    task.add_done_callback(_log_store_conversation_error)
+
+
 def prepare_history(
     user_key: str,
     limit: Optional[int] = None,
@@ -69,7 +81,7 @@ async def send_startup_greeting(channel, user_key: str):
     agent.conversation_history[user_key] = history
 
     new_session_prompt = (
-        "Greet the user, and if useful, briefly mention a topic in one of your previous conversations."
+        "Greet the user, and briefly mention a topic in one of your recent conversations especially if there is an unfinished or ongoing task, in order to remind the user."
     )
     greeting_text = await agent.generate_reply(history, new_session_prompt)
     if not greeting_text:
@@ -78,8 +90,8 @@ async def send_startup_greeting(channel, user_key: str):
 
     safe_reply = trim_for_discord(greeting_text)
     history.extend([AIMessage(content=greeting_text)])
-    agent.store_conversation(user_key, new_session_prompt, greeting_text)
     await channel.send(safe_reply)
+    schedule_store_conversation(user_key, new_session_prompt, greeting_text)
 
 
 async def handle_user_message(message):
@@ -98,8 +110,8 @@ async def handle_user_message(message):
 
     safe_reply = trim_for_discord(reply_text)
     history.extend([HumanMessage(content=prompt), AIMessage(content=reply_text)])
-    agent.store_conversation(user_key, prompt, reply_text)
     await message.channel.send(safe_reply)
+    schedule_store_conversation(user_key, prompt, reply_text)
 
 
 @client.event

@@ -3,6 +3,9 @@ notes.txt
 diary.txt
 creds.json
 test.py
+update_conversation_embeddings.py
+check_migration_progress.py
+migrate_ollama_embeddings.py
 .venv/
 path/
 __pycache__/
