@@ -12,16 +12,20 @@ class ConversationStore:
         embedding_dim: int,
         local_embedding_model: str,
         hybrid_exclude_recent_count: int,
+        command_memory_max_prompt_len: int,
     ):
         self.embedding_dim = embedding_dim
         self.local_embedding_model = local_embedding_model
         self.hybrid_exclude_recent_count = hybrid_exclude_recent_count
+        self.command_memory_max_prompt_len = command_memory_max_prompt_len
         self.db_connection = psycopg2.connect(database_url)
 
         self._enable_pgvector()
         self.create_tables()
         self._ensure_embedding_column()
         self._ensure_text_search_column()
+        self._ensure_command_memory_table()
+        self._rebuild_command_memory_cache()
 
     # MANUALLY CREATE THE EXTENSION AS SUPERUSER IN POSTGRESQL BEFORE RUNNING THE BOT,
     # OTHERWISE EMBEDDINGS WILL BE STORED AS JSON.
@@ -139,6 +143,67 @@ class ConversationStore:
             )
             self.db_connection.commit()
 
+    def _ensure_command_memory_table(self):
+        """Store stable short command-response mappings separately from general chat history."""
+        with self.db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS command_memory (
+                    id SERIAL PRIMARY KEY,
+                    session_id VARCHAR(255) NOT NULL,
+                    trigger_text TEXT NOT NULL,
+                    normalized_trigger TEXT NOT NULL,
+                    response_text TEXT NOT NULL,
+                    usage_count INTEGER NOT NULL DEFAULT 1,
+                    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (session_id, normalized_trigger, response_text)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS command_memory_lookup_idx
+                ON command_memory (session_id, normalized_trigger, usage_count DESC)
+                """
+            )
+            self.db_connection.commit()
+
+    def _rebuild_command_memory_cache(self):
+        """Backfill command memory from existing conversations so old commands resolve immediately."""
+        with self.db_connection.cursor() as cursor:
+            cursor.execute("DELETE FROM command_memory")
+            cursor.execute(
+                """
+                INSERT INTO command_memory (
+                    session_id,
+                    trigger_text,
+                    normalized_trigger,
+                    response_text,
+                    usage_count,
+                    first_seen_at,
+                    last_seen_at
+                )
+                SELECT
+                    session_id,
+                    min(trim(user_message)) AS trigger_text,
+                    lower(trim(user_message)) AS normalized_trigger,
+                    agent_response AS response_text,
+                    COUNT(*) AS usage_count,
+                    min(created_at) AS first_seen_at,
+                    max(created_at) AS last_seen_at
+                FROM conversations
+                WHERE coalesce(trim(user_message), '') <> ''
+                  AND position(' ' in trim(user_message)) = 0
+                  AND char_length(trim(user_message)) <= %s
+                  AND trim(user_message) ~ '^[A-Za-z0-9_-]{2,}$'
+                  AND coalesce(agent_response, '') <> ''
+                GROUP BY session_id, lower(trim(user_message)), agent_response
+                """,
+                (self.command_memory_max_prompt_len,),
+            )
+            self.db_connection.commit()
+
     async def hybrid_search_conversations(
         self,
         query: str,
@@ -162,6 +227,23 @@ class ConversationStore:
                 ),
                 ts_query AS (
                     SELECT websearch_to_tsquery('english', %s) AS query
+                ),
+                exact_candidates AS (
+                    SELECT
+                        id,
+                        user_message,
+                        agent_response,
+                        1.25::float AS text_rank,
+                        0::float AS semantic_score
+                    FROM conversations
+                    WHERE session_id = %s
+                      AND id NOT IN (SELECT id FROM recent_ids)
+                      AND (
+                          lower(coalesce(user_message, '')) LIKE lower('%%' || %s || '%%')
+                          OR lower(coalesce(agent_response, '')) LIKE lower('%%' || %s || '%%')
+                      )
+                    ORDER BY created_at DESC
+                    LIMIT %s
                 ),
                 text_candidates AS (
                     SELECT
@@ -192,6 +274,8 @@ class ConversationStore:
                     LIMIT %s
                 ),
                 combined AS (
+                    SELECT * FROM exact_candidates
+                    UNION ALL
                     SELECT * FROM text_candidates
                     UNION ALL
                     SELECT * FROM semantic_candidates
@@ -241,6 +325,10 @@ class ConversationStore:
                     self.hybrid_exclude_recent_count,
                     query,
                     session_id,
+                    query,
+                    query,
+                    limit,
+                    session_id,
                     limit,
                     vector_literal,
                     session_id,
@@ -272,6 +360,104 @@ class ConversationStore:
                 history.append(HumanMessage(content=user_msg))
                 history.append(AIMessage(content=agent_resp))
             return history
+
+    def has_exact_user_message(
+        self,
+        session_id: str,
+        prompt: str,
+        min_count: int = 2,
+    ) -> bool:
+        """Check whether a normalized prompt has appeared often enough to act as a session command alias."""
+        normalized_prompt = (prompt or "").strip().lower()
+        if not normalized_prompt:
+            return False
+
+        with self.db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM conversations
+                WHERE session_id = %s
+                  AND lower(trim(coalesce(user_message, ''))) = %s
+                """,
+                (session_id, normalized_prompt),
+            )
+            return cursor.fetchone()[0] >= min_count
+
+    def resolve_command_memory(
+        self,
+        session_id: str,
+        prompt: str,
+        min_usage: int,
+        min_share: float,
+    ) -> Optional[str]:
+        """Return a stable command response when one response clearly dominates a short trigger."""
+        normalized_prompt = (prompt or "").strip().lower()
+        if not normalized_prompt:
+            return None
+
+        with self.db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        response_text,
+                        usage_count,
+                        SUM(usage_count) OVER () AS total_usage,
+                        ROW_NUMBER() OVER (
+                            ORDER BY usage_count DESC, last_seen_at DESC, id DESC
+                        ) AS rank_index
+                    FROM command_memory
+                    WHERE session_id = %s
+                      AND normalized_trigger = %s
+                )
+                SELECT response_text, usage_count, total_usage
+                FROM ranked
+                WHERE rank_index = 1
+                """,
+                (session_id, normalized_prompt),
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        response_text, usage_count, total_usage = row
+        if usage_count < min_usage or not total_usage:
+            return None
+
+        if (usage_count / total_usage) < min_share:
+            return None
+
+        return response_text
+
+    def record_command_memory(self, session_id: str, user_message: str, agent_response: str):
+        normalized_trigger = (user_message or "").strip().lower()
+        if not normalized_trigger or not agent_response:
+            return
+
+        with self.db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO command_memory (
+                    session_id,
+                    trigger_text,
+                    normalized_trigger,
+                    response_text,
+                    usage_count,
+                    first_seen_at,
+                    last_seen_at
+                )
+                VALUES (%s, %s, %s, %s, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (session_id, normalized_trigger, response_text)
+                DO UPDATE SET
+                    usage_count = command_memory.usage_count + 1,
+                    trigger_text = EXCLUDED.trigger_text,
+                    last_seen_at = CURRENT_TIMESTAMP
+                """,
+                (session_id, user_message, normalized_trigger, agent_response),
+            )
+            self.db_connection.commit()
 
     def save_conversation(self, session_id: str, user_message: str, agent_response: str, embedding):
         with self.db_connection.cursor() as cursor:
