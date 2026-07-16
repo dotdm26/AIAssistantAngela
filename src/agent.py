@@ -1,17 +1,16 @@
 import os
 import asyncio
 import re
+import json
+from typing import List, Union, Optional
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 # Avoid HF Xet/CAS path issues in some environments (401 Unauthorized on public repos).
 # os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
-from typing import List, Union, Optional
-
-from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-from config import (
+from src.config import (
     COMMAND_MEMORY_MAX_PROMPT_LEN,
     COMMAND_MEMORY_MIN_SHARE,
     COMMAND_MEMORY_MIN_USAGE,
@@ -23,11 +22,23 @@ from config import (
     HYBRID_MIN_SCORE,
     HYBRID_MIN_SCORE_MEMORY,
 )
-from conversation_store import ConversationStore
-from embeddings import LocalNomicEmbeddings, detect_embedding_dimension
-from prompts import build_system_prompt
+from src.conversation_store import ConversationStore
+from src.embeddings import LocalNomicEmbeddings, detect_embedding_dimension
+from src.prompts import build_system_prompt
+from src.tools.commands import (
+    save_command,
+    use_command,
+    process_command,
+    detect_command_registration,
+    detect_command_lookup,
+    is_command_candidate,
+)
 
 load_dotenv()
+
+MEMORY_INTENT_RE = re.compile(
+    r"\b(remind|remember|earlier|previous|before|last time|you said|we said|continue|recap|summary|what did i)\b"
+)
 
 
 # avoid sending empty messages to the LLM, which can cause errors
@@ -45,12 +56,60 @@ def _extract_text(content):
     return str(content).strip()
 
 
+def _is_command_candidate(text: str) -> bool:
+    return is_command_candidate(text, max_len=COMMAND_MEMORY_MAX_PROMPT_LEN)
+
+
+def _looks_like_memory_key(text: str) -> bool:
+    stripped = (text or "").strip().lower()
+    if not stripped or len(stripped) > 64:
+        return False
+    return bool(re.fullmatch(r"[a-z0-9_-]{4,}", stripped) and re.search(r"\d", stripped))
+
+
+def _is_explicit_memory_intent(text: str) -> bool:
+    return bool(MEMORY_INTENT_RE.search((text or "").strip().lower()))
+
+
+def _hybrid_score_threshold(text: str) -> float:
+    return HYBRID_MIN_SCORE_MEMORY if (_looks_like_memory_key(text) or _is_explicit_memory_intent(text)) else HYBRID_MIN_SCORE
+
+
+def _estimate_token_count(messages: List[Union[HumanMessage, AIMessage, SystemMessage]]) -> int:
+    # Fast approximation for observability: ~4 chars per token for English-heavy text.
+    total_chars = 0
+    for message in messages:
+        total_chars += len(_extract_text(getattr(message, "content", "")))
+    return max(1, total_chars // 4)
+
+
+def _format_hybrid_context(results) -> str:
+    if not results:
+        return ""
+
+    lines = ["Relevant past conversations:"]
+    for user_message, agent_response, text_rank, semantic_score, hybrid_score in results:
+        user_text = _extract_text(user_message)
+        agent_text = _extract_text(agent_response)
+        lines.append(
+            f"- User: {user_text}\n  Assistant: {agent_text}\n  Scores: text={text_rank:.3f}, semantic={semantic_score:.3f}, hybrid={hybrid_score:.3f}"
+        )
+
+    return "\n".join(lines)
+
+
 class AIAgent:
     def __init__(self):
         self.llm = ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model="gemini-3.1-flash-lite")
+        self.llm_with_tools = self.llm.bind_tools([save_command, use_command, process_command])
         self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
         self.embedding_dim = detect_embedding_dimension(self.embeddings)
         self.conversation_history = {}
+        self.tools_by_name = {
+            "save_command": save_command,
+            "use_command": use_command,
+            "process_command": process_command,
+        }
 
         self.store = ConversationStore(
             database_url=os.getenv("DATABASE_URL"),
@@ -63,77 +122,6 @@ class AIAgent:
         # Agent configuration
         self.system_prompt = build_system_prompt(os.getenv("EXTRA_INSTRUCTIONS"))
 
-    def _format_hybrid_context(self, results) -> str:
-        if not results:
-            return ""
-
-        lines = ["Relevant past conversations:"]
-        for user_message, agent_response, text_rank, semantic_score, hybrid_score in results:
-            user_text = _extract_text(user_message)
-            agent_text = _extract_text(agent_response)
-            lines.append(
-                f"- User: {user_text}\n  Assistant: {agent_text}\n  Scores: text={text_rank:.3f}, semantic={semantic_score:.3f}, hybrid={hybrid_score:.3f}"
-            )
-
-        return "\n".join(lines)
-
-    def _should_use_hybrid_search(self, prompt: str, session_id: Optional[str] = None) -> bool:
-        text = _extract_text(prompt).lower()
-        if len(text) >= HYBRID_MIN_PROMPT_CHARS:
-            return True
-
-        if self._looks_like_memory_key(text):
-            return True
-
-        if session_id and self._is_session_memory_alias(session_id, text):
-            return True
-
-        # For short prompts, only retrieve when the user implies memory/reference intent.
-        return self._is_explicit_memory_intent(text)
-
-    def _is_explicit_memory_intent(self, text: str) -> bool:
-        return bool(
-            re.search(
-                r"\b(remind|remember|earlier|previous|before|last time|you said|we said|continue|recap|summary|what did i)\b",
-                text,
-            )
-        )
-
-    def _get_hybrid_score_threshold(self, text: str) -> float:
-        if self._looks_like_memory_key(text) or self._is_explicit_memory_intent(text):
-            return HYBRID_MIN_SCORE_MEMORY
-        return HYBRID_MIN_SCORE
-
-    def _is_session_memory_alias(self, session_id: str, text: str) -> bool:
-        stripped = text.strip()
-        if not stripped or " " in stripped or len(stripped) > COMMAND_MEMORY_MAX_PROMPT_LEN:
-            return False
-
-        # Reused short prompts in the same session often represent custom commands.
-        return self.store.has_exact_user_message(session_id, stripped, min_count=2)
-
-    def _looks_like_memory_key(self, text: str) -> bool:
-        """Detect short key-like prompts (e.g., pingpong123) that should force retrieval."""
-        stripped = text.strip()
-        if not stripped or len(stripped) > 64:
-            return False
-
-        # Single-token alphanumeric keys with digits are common user-defined memory triggers.
-        return bool(re.fullmatch(r"[a-z0-9_-]{4,}", stripped) and re.search(r"\d", stripped))
-
-    def _is_command_candidate(self, text: str) -> bool:
-        stripped = text.strip().lower()
-        if not stripped or len(stripped) > COMMAND_MEMORY_MAX_PROMPT_LEN or " " in stripped:
-            return False
-        return bool(re.fullmatch(r"[a-z0-9_-]{2,}", stripped))
-
-    def _estimate_token_count(self, messages: List[Union[HumanMessage, AIMessage, SystemMessage]]) -> int:
-        # Fast approximation for observability: ~4 chars per token for English-heavy text.
-        total_chars = 0
-        for message in messages:
-            total_chars += len(_extract_text(getattr(message, "content", "")))
-        return max(1, total_chars // 4)
-
     def get_conversation_history(
         self,
         session_id: str,
@@ -141,6 +129,153 @@ class AIAgent:
     ) -> List[Union[HumanMessage, AIMessage, SystemMessage]]:
         """Retrieve conversation history for context."""
         return self.store.get_conversation_history(session_id, limit=limit)
+
+    async def _handle_direct_command_intent(self, prompt: str, prompt_text: str, session_id: Optional[str]) -> Optional[str]:
+        if not session_id:
+            return None
+
+        registration = detect_command_registration(prompt)
+        if registration:
+            command_key, command_response = registration
+            await asyncio.to_thread(
+                self.store.record_command_memory,
+                session_id,
+                command_key,
+                command_response,
+            )
+            return f"Registered command '{command_key}'."
+
+        if not _is_command_candidate(prompt_text):
+            return None
+
+        lookup_key = detect_command_lookup(prompt)
+        command_key = lookup_key or prompt_text
+        command_response = self.store.resolve_command_memory(
+            session_id,
+            command_key,
+            min_usage=COMMAND_MEMORY_MIN_USAGE,
+            min_share=COMMAND_MEMORY_MIN_SHARE,
+        )
+        if command_response:
+            print(
+                f"[command_memory] resolved exact command | prompt={command_key!r} "
+                f"min_usage={COMMAND_MEMORY_MIN_USAGE} min_share={COMMAND_MEMORY_MIN_SHARE:.2f}"
+            )
+            return command_response
+
+        stripped_prompt = prompt.strip()
+        if lookup_key and (stripped_prompt.startswith("/") or " " in stripped_prompt):
+            return f"I could not find a registered command for '{lookup_key}'."
+
+        return None
+
+    async def _maybe_add_retrieval_context(
+        self,
+        messages: List[Union[HumanMessage, AIMessage, SystemMessage]],
+        prompt: str,
+        prompt_text: str,
+        session_id: Optional[str],
+    ) -> str:
+        if not session_id:
+            return ""
+
+        is_session_memory_alias = bool(
+            _is_command_candidate(prompt_text)
+            and self.store.has_exact_user_message(session_id, prompt_text, min_count=2)
+        )
+        should_use_hybrid_search = (
+            len(prompt_text) >= HYBRID_MIN_PROMPT_CHARS
+            or _looks_like_memory_key(prompt_text)
+            or is_session_memory_alias
+            or _is_explicit_memory_intent(prompt_text)
+        )
+        if not should_use_hybrid_search:
+            return ""
+
+        retrieval_context = ""
+        try:
+            retrieval_limit = HYBRID_TOP_K
+            if _looks_like_memory_key(prompt_text) or is_session_memory_alias:
+                retrieval_limit = max(HYBRID_TOP_K, 10)
+
+            related_conversations = await self.store.hybrid_search_conversations(
+                prompt,
+                session_id,
+                embedding_provider=self.generate_embedding,
+                limit=retrieval_limit,
+            )
+
+            top_hybrid_score = max((row[4] for row in related_conversations), default=0.0)
+            threshold = _hybrid_score_threshold(prompt_text)
+            if is_session_memory_alias:
+                threshold = min(threshold, HYBRID_MIN_SCORE_MEMORY)
+
+            if top_hybrid_score >= threshold:
+                retrieval_context = _format_hybrid_context(related_conversations)
+                messages.append(SystemMessage(content=retrieval_context))
+            else:
+                print(
+                    f"[hybrid_filter] skipped retrieval context | "
+                    f"top_score={top_hybrid_score:.3f} < threshold={threshold:.3f}"
+                )
+        except Exception as exc:
+            print(f"Hybrid search failed: {exc}")
+
+        return retrieval_context
+
+    async def _invoke_model_with_tools(
+        self,
+        sanitized_messages: List[Union[HumanMessage, AIMessage, SystemMessage]],
+        session_id: Optional[str],
+    ):
+        conversation_for_model = list(sanitized_messages)
+        max_tool_rounds = 3
+        response = None
+        for _ in range(max_tool_rounds):
+            if hasattr(self.llm_with_tools, "ainvoke"):
+                response = await self.llm_with_tools.ainvoke(conversation_for_model)
+            else:
+                response = await asyncio.to_thread(self.llm_with_tools.invoke, conversation_for_model)
+
+            tool_calls = getattr(response, "tool_calls", None) or []
+            if not tool_calls:
+                break
+
+            conversation_for_model.append(response)
+            for tool_call in tool_calls:
+                tool_name = tool_call.get("name", "")
+                tool_args = tool_call.get("args", {})
+                tool_id = tool_call.get("id")
+                tool_fn = self.tools_by_name.get(tool_name)
+
+                if not tool_fn:
+                    tool_output = f"Unknown tool: {tool_name}"
+                else:
+                    if not isinstance(tool_args, dict):
+                        try:
+                            tool_args = json.loads(tool_args) if isinstance(tool_args, str) else {}
+                        except Exception:
+                            tool_args = {}
+
+                    if "session_id" not in tool_args and session_id:
+                        tool_args["session_id"] = session_id
+
+                    try:
+                        tool_output = tool_fn.invoke(tool_args)
+                    except Exception as exc:
+                        tool_output = f"Tool execution error: {exc}"
+
+                conversation_for_model.append(
+                    ToolMessage(
+                        content=str(tool_output),
+                        tool_call_id=tool_id,
+                    )
+                )
+
+        if response is None:
+            raise RuntimeError("No model response received")
+
+        return response
 
     async def generate_reply(
         self,
@@ -152,52 +287,13 @@ class AIAgent:
             raise ValueError("Empty prompt")
 
         messages = list(history)
-
         prompt_text = _extract_text(prompt).lower()
-        if session_id and self._is_command_candidate(prompt_text):
-            command_response = self.store.resolve_command_memory(
-                session_id,
-                prompt_text,
-                min_usage=COMMAND_MEMORY_MIN_USAGE,
-                min_share=COMMAND_MEMORY_MIN_SHARE,
-            )
-            if command_response:
-                print(
-                    f"[command_memory] resolved exact command | prompt={prompt_text!r} "
-                    f"min_usage={COMMAND_MEMORY_MIN_USAGE} min_share={COMMAND_MEMORY_MIN_SHARE:.2f}"
-                )
-                return command_response
 
-        retrieval_context = ""
-        if session_id and self._should_use_hybrid_search(prompt, session_id=session_id):
-            try:
-                retrieval_limit = HYBRID_TOP_K
-                is_memory_alias = self._is_session_memory_alias(session_id, prompt_text)
-                if self._looks_like_memory_key(prompt_text) or is_memory_alias:
-                    retrieval_limit = max(HYBRID_TOP_K, 10)
+        direct_command_response = await self._handle_direct_command_intent(prompt, prompt_text, session_id)
+        if direct_command_response is not None:
+            return direct_command_response
 
-                related_conversations = await self.store.hybrid_search_conversations(
-                    prompt,
-                    session_id,
-                    embedding_provider=self.generate_embedding,
-                    limit=retrieval_limit,
-                )
-
-                top_hybrid_score = max((row[4] for row in related_conversations), default=0.0)
-                threshold = self._get_hybrid_score_threshold(prompt_text)
-                if is_memory_alias:
-                    threshold = min(threshold, HYBRID_MIN_SCORE_MEMORY)
-
-                if top_hybrid_score >= threshold:
-                    retrieval_context = self._format_hybrid_context(related_conversations)
-                    messages.append(SystemMessage(content=retrieval_context))
-                else:
-                    print(
-                        f"[hybrid_filter] skipped retrieval context | "
-                        f"top_score={top_hybrid_score:.3f} < threshold={threshold:.3f}"
-                    )
-            except Exception as exc:
-                print(f"Hybrid search failed: {exc}")
+        retrieval_context = await self._maybe_add_retrieval_context(messages, prompt, prompt_text, session_id)
 
         messages.append(HumanMessage(content=prompt))
         sanitized_messages = []
@@ -207,16 +303,13 @@ class AIAgent:
             if text:
                 sanitized_messages.append(message)
 
-        estimated_input_tokens = self._estimate_token_count(sanitized_messages)
+        estimated_input_tokens = _estimate_token_count(sanitized_messages)
         print(
             f"[token_estimate] input~{estimated_input_tokens} tokens | "
             f"messages={len(sanitized_messages)} | hybrid_used={bool(retrieval_context)}"
         )
 
-        if hasattr(self.llm, "ainvoke"):
-            response = await self.llm.ainvoke(sanitized_messages)
-        else:
-            response = await asyncio.to_thread(self.llm.invoke, sanitized_messages)
+        response = await self._invoke_model_with_tools(sanitized_messages, session_id)
 
         if hasattr(response, "usage_metadata"):
             print(f"[token_usage] {response.usage_metadata}")
@@ -251,7 +344,7 @@ class AIAgent:
             agent_response,
             embedding,
         )
-        if self._is_command_candidate(_extract_text(user_message)):
+        if _is_command_candidate(_extract_text(user_message)):
             await asyncio.to_thread(
                 self.store.record_command_memory,
                 session_id,

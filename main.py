@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 from typing import Optional, Union
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from agent import AIAgent
+from src.agent import AIAgent
 
 load_dotenv()
 
