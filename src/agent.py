@@ -7,6 +7,7 @@ from typing import List, Union, Optional
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
 
 # Avoid HF Xet/CAS path issues in some environments (401 Unauthorized on public repos).
 # os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -25,7 +26,7 @@ from src.config import (
 )
 from src.conversation_store import ConversationStore
 from src.embeddings import LocalNomicEmbeddings, detect_embedding_dimension
-from src.prompts import build_system_prompt
+from src.prompts import build_system_prompt, configure_formatting
 from src.tools.commands import (
     save_command,
     use_command,
@@ -35,6 +36,7 @@ from src.tools.commands import (
     is_command_candidate,
 )
 from src.tools.calendar_tools import (
+    get_time,
     list_calendars,
     get_upcoming_calendar_events,
     get_calendar_events_between,
@@ -50,6 +52,7 @@ tool_list = [
     save_command,
     use_command,
     process_command,
+    get_time,
     list_calendars,
     get_upcoming_calendar_events,
     get_calendar_events_between
@@ -99,6 +102,7 @@ def _is_explicit_memory_intent(text: str) -> bool:
 
 
 def _hybrid_score_threshold(text: str) -> float:
+    
     return HYBRID_MIN_SCORE_MEMORY if (_looks_like_memory_key(text) or _is_explicit_memory_intent(text)) else HYBRID_MIN_SCORE
 
 
@@ -124,9 +128,14 @@ def _format_hybrid_context(results) -> str:
 
     return "\n".join(lines)
 
+#class AngelaResponse(BaseModel):
+#    reply: str = Field(
+#        description=configure_formatting()
+#    )
 
 class AIAgent:
     def __init__(self):
+        
         self.llm = ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model="gemini-3.1-flash-lite")
         self.llm_with_tools = self.llm.bind_tools(tool_list)
         self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)

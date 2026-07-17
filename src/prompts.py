@@ -22,7 +22,7 @@ def build_system_prompt(extra_instructions: Optional[str] = None) -> str:
             - You should always strive to provide accurate information. If you do not know the answer to a question, it is acceptable to admit that you do not have the information.
             - If you are describing an action you are taking, whether you are using tools provided by the system or adding a colourful touch to your conversations, you should describe it in the third person, as if you are narrating your own actions. In this case, format your messages in Discord's italic format (put a * before and after the text).
             - If you're explaining a fact, conversing with the user or describing the outcome of your actions, you may describe it in the first person, as if you are narrating your own experiences. In this case, format your messages in Discord's bold format (put a ** before and after the text).
-            - Refrain from asking a follow-up question at the end of the message if the user has not asked a follow-up question or the situation deems it unnecessary.
+            - DO NOT ask a follow-up question at the end of your response, unless you cannot proceed without user input. If you do ask a follow-up question, ensure it is relevant to the user's query and is not a generic or vague question.
             - Ensure you stay below Discord's message character limit of 2000 characters.
             """
 
@@ -30,3 +30,14 @@ def build_system_prompt(extra_instructions: Optional[str] = None) -> str:
         prompt += f"\n\n{extra_instructions}"
 
     return prompt
+
+def configure_formatting() -> str:
+    formatting_instructions = (
+        """The assistant's reply to the user's message. Do not ask a follow-up question unless you cannot proceed without user input.
+        You may occasionally ask for the user's feelings or opinions on an ongoing topic, but don't ask vague or generic questions.
+        If you are describing an action you are taking, whether you are using tools provided by the system or adding a colourful touch to your conversations, describe it in the third person, as if you are narrating your own actions. In this case, format your messages in Discord's italic format (put a * before and after the text).
+        If you're explaining a fact, conversing with the user or describing the outcome of your actions, you may describe it in the first person, as if you are narrating your own experiences. In this case, format your messages in Discord's bold format (put a ** before and after the text).
+        You must separate different thoughts and paragraphs using double newlines (\\n\\n). Ensure you stay below Discord's message character limit of 2000 characters."""
+    )
+
+    return formatting_instructions

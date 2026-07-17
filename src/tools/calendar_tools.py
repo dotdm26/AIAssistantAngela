@@ -1,4 +1,5 @@
 import datetime
+import zoneinfo
 import os.path
 from pathlib import Path
 import json
@@ -65,6 +66,14 @@ def _event_to_dict(event: dict) -> dict:
       "htmlLink": event.get("htmlLink", ""),
   }
 
+@tool
+def get_time() -> str:
+  """Get the current time in ISO format for Europe/London timezone."""
+  try:
+    now = datetime.datetime.now(tz=zoneinfo.ZoneInfo("Europe/London"))
+    return now.isoformat()
+  except Exception as error:
+    return json.dumps({"error": str(error)})
 
 @tool
 def list_calendars() -> str:
