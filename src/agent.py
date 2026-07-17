@@ -2,6 +2,7 @@ import os
 import asyncio
 import re
 import json
+import inspect
 from typing import List, Union, Optional
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -33,6 +34,11 @@ from src.tools.commands import (
     detect_command_lookup,
     is_command_candidate,
 )
+from src.tools.calendar_tools import (
+    list_calendars,
+    get_upcoming_calendar_events,
+    get_calendar_events_between,
+)
 
 load_dotenv()
 
@@ -40,6 +46,27 @@ MEMORY_INTENT_RE = re.compile(
     r"\b(remind|remember|earlier|previous|before|last time|you said|we said|continue|recap|summary|what did i)\b"
 )
 
+tool_list = [
+    save_command,
+    use_command,
+    process_command,
+    list_calendars,
+    get_upcoming_calendar_events,
+    get_calendar_events_between
+]
+
+tool_names = {tool.name: tool for tool in tool_list}
+
+
+def _tool_accepts_arg(tool_obj, arg_name: str) -> bool:
+    try:
+        fn = getattr(tool_obj, "func", None)
+        if not callable(fn):
+            return False
+        signature = inspect.signature(fn)
+        return arg_name in signature.parameters
+    except Exception:
+        return False
 
 # avoid sending empty messages to the LLM, which can cause errors
 def _extract_text(content):
@@ -101,15 +128,11 @@ def _format_hybrid_context(results) -> str:
 class AIAgent:
     def __init__(self):
         self.llm = ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model="gemini-3.1-flash-lite")
-        self.llm_with_tools = self.llm.bind_tools([save_command, use_command, process_command])
+        self.llm_with_tools = self.llm.bind_tools(tool_list)
         self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
         self.embedding_dim = detect_embedding_dimension(self.embeddings)
         self.conversation_history = {}
-        self.tools_by_name = {
-            "save_command": save_command,
-            "use_command": use_command,
-            "process_command": process_command,
-        }
+        self.tools_by_name = tool_names
 
         self.store = ConversationStore(
             database_url=os.getenv("DATABASE_URL"),
@@ -257,7 +280,7 @@ class AIAgent:
                         except Exception:
                             tool_args = {}
 
-                    if "session_id" not in tool_args and session_id:
+                    if "session_id" not in tool_args and session_id and _tool_accepts_arg(tool_fn, "session_id"):
                         tool_args["session_id"] = session_id
 
                     try:

@@ -54,7 +54,6 @@ def _ensure_command_memory_table(conn):
 
 
 def detect_command_registration(message: str):
-    print(f"detect_command_registration invoked with message={message}")
     """Return (command_key, response_text) when user message defines a new command."""
     text = (message or "").strip()
     if not text:

@@ -1,7 +1,8 @@
 .env
 notes.txt
 diary.txt
-creds.json
+src/tools/client_secrets.json
+src/tools/token.json
 .venv/
 path/
 __pycache__/
