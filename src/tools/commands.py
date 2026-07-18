@@ -12,7 +12,6 @@ dotenv.load_dotenv()
 
 COMMAND_TOKEN_RE = re.compile(r"^[a-z0-9_-]{2,64}$")
 
-
 def _normalize_command_key(text: str) -> str:
     return (text or "").strip().lower()
 
@@ -65,7 +64,7 @@ def detect_command_registration(message: str):
             re.IGNORECASE,
         ),
         re.compile(
-            r"^(?:when i say|if i say)\s+([a-z0-9_-]{2,64})\s*,?\s*(?:respond|reply|do|run|execute)\s+(.+)$",
+            r"^(?:when i say|if i say|from now on)\s+([a-z0-9_-]{2,64})\s*,?\s*(?:respond|reply|do|run|execute)\s+(.+)$",
             re.IGNORECASE,
         ),
     ]
@@ -100,9 +99,6 @@ def detect_command_lookup(message: str):
     )
     if explicit:
         return _normalize_command_key(explicit.group(1))
-
-    if is_command_candidate(text):
-        return _normalize_command_key(text)
 
     return None
 
@@ -239,3 +235,10 @@ def process_command(message: str, session_id: str = "global") -> str:
         )
     except Exception as e:
         return json.dumps({"intent": "error", "status": "failed", "result": str(e)})
+
+
+commands_list = [
+    save_command,
+    use_command,
+    process_command,
+]

@@ -8,14 +8,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
-
-# Avoid HF Xet/CAS path issues in some environments (401 Unauthorized on public repos).
-# os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-
 from src.config import (
-    COMMAND_MEMORY_MAX_PROMPT_LEN,
-    COMMAND_MEMORY_MIN_SHARE,
-    COMMAND_MEMORY_MIN_USAGE,
     GOOGLE_API_KEY,
     LOCAL_EMBEDDING_MODEL,
     HYBRID_TOP_K,
@@ -23,42 +16,43 @@ from src.config import (
     HYBRID_EXCLUDE_RECENT_COUNT,
     HYBRID_MIN_SCORE,
     HYBRID_MIN_SCORE_MEMORY,
+    COMMAND_MEMORY_MAX_PROMPT_LEN,
+    COMMAND_MEMORY_MIN_USAGE,
+    COMMAND_MEMORY_MIN_SHARE,
 )
 from src.conversation_store import ConversationStore
 from src.embeddings import LocalNomicEmbeddings, detect_embedding_dimension
 from src.prompts import build_system_prompt, configure_formatting
 from src.tools.commands import (
-    save_command,
-    use_command,
-    process_command,
+    commands_list,
     detect_command_registration,
     detect_command_lookup,
     is_command_candidate,
 )
-from src.tools.calendar_tools import (
-    get_time,
-    list_calendars,
-    get_upcoming_calendar_events,
-    get_calendar_events_between,
-)
+from src.tools.calendar_tools import calendar_tools_list
 
 load_dotenv()
 
 MEMORY_INTENT_RE = re.compile(
     r"\b(remind|remember|earlier|previous|before|last time|you said|we said|continue|recap|summary|what did i)\b"
 )
+TOOL_INTENT_RE = re.compile(
+    r"\b(calendar|event|schedule|meeting|reminder|time|date|run|execute|use command|/\w+)\b"
+)
 
 tool_list = [
-    save_command,
-    use_command,
-    process_command,
-    get_time,
-    list_calendars,
-    get_upcoming_calendar_events,
-    get_calendar_events_between
+    *commands_list,
+    *calendar_tools_list
 ]
 
 tool_names = {tool.name: tool for tool in tool_list}
+READ_ONLY_TOOL_NAMES = {
+    "use_command",
+    "get_time",
+    "list_calendars",
+    "get_upcoming_calendar_events",
+    "get_calendar_events_between",
+}
 
 
 def _tool_accepts_arg(tool_obj, arg_name: str) -> bool:
@@ -101,6 +95,17 @@ def _is_explicit_memory_intent(text: str) -> bool:
     return bool(MEMORY_INTENT_RE.search((text or "").strip().lower()))
 
 
+def _should_enable_tools(prompt: str) -> bool:
+    text = _extract_text(prompt).strip().lower()
+    if not text:
+        return False
+
+    if detect_command_registration(text) or detect_command_lookup(text):
+        return True
+
+    return bool(TOOL_INTENT_RE.search(text))
+
+
 def _hybrid_score_threshold(text: str) -> float:
     
     return HYBRID_MIN_SCORE_MEMORY if (_looks_like_memory_key(text) or _is_explicit_memory_intent(text)) else HYBRID_MIN_SCORE
@@ -128,10 +133,9 @@ def _format_hybrid_context(results) -> str:
 
     return "\n".join(lines)
 
-#class AngelaResponse(BaseModel):
-#    reply: str = Field(
-#        description=configure_formatting()
-#    )
+
+def _tool_is_read_only(tool_name: str) -> bool:
+    return tool_name in READ_ONLY_TOOL_NAMES
 
 class AIAgent:
     def __init__(self):
@@ -153,6 +157,31 @@ class AIAgent:
 
         # Agent configuration
         self.system_prompt = build_system_prompt(os.getenv("EXTRA_INSTRUCTIONS"))
+
+    def should_enable_tools(self, prompt: str) -> bool:
+        """Public helper for callers to detect whether this prompt is likely to trigger tools."""
+        return _should_enable_tools(prompt)
+
+    async def generate_tool_acknowledgement(self, prompt: str) -> str:
+        """Generate a brief acknowledgement for likely tool-calling turns."""
+        ack_messages = [
+            SystemMessage(
+                content=(
+                    "Write one short acknowledgement sentence (max 12 words). "
+                    "Confirm you are working on the user's request now. "
+                    "Do not ask questions."
+                )
+            ),
+            HumanMessage(content=prompt),
+        ]
+
+        if hasattr(self.llm, "ainvoke"):
+            response = await self.llm.ainvoke(ack_messages)
+        else:
+            response = await asyncio.to_thread(self.llm.invoke, ack_messages)
+
+        text = _extract_text(getattr(response, "content", response))
+        return text or "Got it. Working on that now..."
 
     def get_conversation_history(
         self,
@@ -201,7 +230,7 @@ class AIAgent:
 
         return None
 
-    async def _maybe_add_retrieval_context(
+    async def _check_retrieval_context(
         self,
         messages: List[Union[HumanMessage, AIMessage, SystemMessage]],
         prompt: str,
@@ -259,7 +288,13 @@ class AIAgent:
         self,
         sanitized_messages: List[Union[HumanMessage, AIMessage, SystemMessage]],
         session_id: Optional[str],
+        enable_tools: bool = True,
     ):
+        if not enable_tools:
+            if hasattr(self.llm, "ainvoke"):
+                return await self.llm.ainvoke(sanitized_messages)
+            return await asyncio.to_thread(self.llm.invoke, sanitized_messages)
+
         conversation_for_model = list(sanitized_messages)
         max_tool_rounds = 3
         response = None
@@ -274,6 +309,37 @@ class AIAgent:
                 break
 
             conversation_for_model.append(response)
+            can_parallelize = all(_tool_is_read_only(tool_call.get("name", "")) for tool_call in tool_calls)
+            if can_parallelize:
+                async def _invoke_one(tool_call):
+                    tool_name = tool_call.get("name", "")
+                    tool_args = tool_call.get("args", {})
+                    tool_id = tool_call.get("id")
+                    tool_fn = self.tools_by_name.get(tool_name)
+
+                    if not tool_fn:
+                        return ToolMessage(content=f"Unknown tool: {tool_name}", tool_call_id=tool_id)
+
+                    if not isinstance(tool_args, dict):
+                        try:
+                            tool_args = json.loads(tool_args) if isinstance(tool_args, str) else {}
+                        except Exception:
+                            tool_args = {}
+
+                    if "session_id" not in tool_args and session_id and _tool_accepts_arg(tool_fn, "session_id"):
+                        tool_args["session_id"] = session_id
+
+                    try:
+                        tool_output = await asyncio.to_thread(tool_fn.invoke, tool_args)
+                    except Exception as exc:
+                        tool_output = f"Tool execution error: {exc}"
+
+                    return ToolMessage(content=str(tool_output), tool_call_id=tool_id)
+
+                tool_messages = await asyncio.gather(*[_invoke_one(tool_call) for tool_call in tool_calls])
+                conversation_for_model.extend(tool_messages)
+                continue
+
             for tool_call in tool_calls:
                 tool_name = tool_call.get("name", "")
                 tool_args = tool_call.get("args", {})
@@ -325,7 +391,7 @@ class AIAgent:
         if direct_command_response is not None:
             return direct_command_response
 
-        retrieval_context = await self._maybe_add_retrieval_context(messages, prompt, prompt_text, session_id)
+        retrieval_context = await self._check_retrieval_context(messages, prompt, prompt_text, session_id)
 
         messages.append(HumanMessage(content=prompt))
         sanitized_messages = []
@@ -341,7 +407,12 @@ class AIAgent:
             f"messages={len(sanitized_messages)} | hybrid_used={bool(retrieval_context)}"
         )
 
-        response = await self._invoke_model_with_tools(sanitized_messages, session_id)
+        enable_tools = _should_enable_tools(prompt)
+        response = await self._invoke_model_with_tools(
+            sanitized_messages,
+            session_id,
+            enable_tools=enable_tools,
+        )
 
         if hasattr(response, "usage_metadata"):
             print(f"[token_usage] {response.usage_metadata}")
@@ -376,13 +447,6 @@ class AIAgent:
             agent_response,
             embedding,
         )
-        if _is_command_candidate(_extract_text(user_message)):
-            await asyncio.to_thread(
-                self.store.record_command_memory,
-                session_id,
-                user_message,
-                agent_response,
-            )
 
     def close(self):
         """Clean up resources."""
