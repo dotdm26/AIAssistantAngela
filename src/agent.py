@@ -7,8 +7,8 @@ from typing import List, Union, Optional
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from pydantic import BaseModel, Field
-from src.config import (
+from sentence_transformers import SentenceTransformer, util
+from src.utils.config import (
     GOOGLE_API_KEY,
     LOCAL_EMBEDDING_MODEL,
     HYBRID_TOP_K,
@@ -19,10 +19,23 @@ from src.config import (
     COMMAND_MEMORY_MAX_PROMPT_LEN,
     COMMAND_MEMORY_MIN_USAGE,
     COMMAND_MEMORY_MIN_SHARE,
+    MAX_TOOL_ROUNDS,
+    TOOL_FILTER_MIN_SCORE,
 )
 from src.conversation_store import ConversationStore
-from src.embeddings import LocalNomicEmbeddings, detect_embedding_dimension
-from src.prompts import build_system_prompt, configure_formatting
+from src.utils.embeddings import LocalNomicEmbeddings, detect_embedding_dimension
+from src.utils.prompts import build_system_prompt, configure_formatting
+from src.utils.trackers import (
+    estimate_token_count,
+    log_hybrid_filter_skipped,
+    log_token_estimate_input,
+    log_token_estimate_output,
+    log_token_usage,
+    log_tool_filter_fallback,
+    log_tool_filter_selected,
+    log_tool_router_decision,
+    log_tool_router_fallback,
+)
 from src.tools.commands import (
     commands_list,
     detect_command_registration,
@@ -40,12 +53,11 @@ TOOL_INTENT_RE = re.compile(
     r"\b(calendar|event|schedule|meeting|reminder|time|date|run|execute|use command|/\w+)\b"
 )
 
-tool_list = [
-    *commands_list,
-    *calendar_tools_list
-]
+commands_tool_names = {tool.name: tool for tool in commands_list}
+calendar_tool_names = {tool.name: tool for tool in calendar_tools_list}
 
-tool_names = {tool.name: tool for tool in tool_list}
+tools_list = commands_list + calendar_tools_list
+
 READ_ONLY_TOOL_NAMES = {
     "use_command",
     "get_time",
@@ -95,28 +107,9 @@ def _is_explicit_memory_intent(text: str) -> bool:
     return bool(MEMORY_INTENT_RE.search((text or "").strip().lower()))
 
 
-def _should_enable_tools(prompt: str) -> bool:
-    text = _extract_text(prompt).strip().lower()
-    if not text:
-        return False
-
-    if detect_command_registration(text) or detect_command_lookup(text):
-        return True
-
-    return bool(TOOL_INTENT_RE.search(text))
-
-
 def _hybrid_score_threshold(text: str) -> float:
     
     return HYBRID_MIN_SCORE_MEMORY if (_looks_like_memory_key(text) or _is_explicit_memory_intent(text)) else HYBRID_MIN_SCORE
-
-
-def _estimate_token_count(messages: List[Union[HumanMessage, AIMessage, SystemMessage]]) -> int:
-    # Fast approximation for observability: ~4 chars per token for English-heavy text.
-    total_chars = 0
-    for message in messages:
-        total_chars += len(_extract_text(getattr(message, "content", "")))
-    return max(1, total_chars // 4)
 
 
 def _format_hybrid_context(results) -> str:
@@ -141,11 +134,14 @@ class AIAgent:
     def __init__(self):
         
         self.llm = ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model="gemini-3.1-flash-lite")
-        self.llm_with_tools = self.llm.bind_tools(tool_list)
+        self.llm_commands = self.llm.bind_tools(commands_list)
+        self.llm_calendar = self.llm.bind_tools(calendar_tools_list)
+        self.tool_filter = ToolFilter()
+        self._bound_tools_cache = {}
         self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
         self.embedding_dim = detect_embedding_dimension(self.embeddings)
         self.conversation_history = {}
-        self.tools_by_name = tool_names
+        self.tools_by_name = {**commands_tool_names, **calendar_tool_names}
 
         self.store = ConversationStore(
             database_url=os.getenv("DATABASE_URL"),
@@ -160,14 +156,14 @@ class AIAgent:
 
     def should_enable_tools(self, prompt: str) -> bool:
         """Public helper for callers to detect whether this prompt is likely to trigger tools."""
-        return _should_enable_tools(prompt)
+        return self.tool_filter.has_tool_intent(prompt)
 
     async def generate_tool_acknowledgement(self, prompt: str) -> str:
         """Generate a brief acknowledgement for likely tool-calling turns."""
         ack_messages = [
             SystemMessage(
                 content=(
-                    "Write one short acknowledgement sentence (max 12 words). "
+                    "Write one short acknowledgement sentence (max 12 words). Keep your response in bold by adding ** around the text. "
                     "Confirm you are working on the user's request now. "
                     "Do not ask questions."
                 )
@@ -275,19 +271,17 @@ class AIAgent:
                 retrieval_context = _format_hybrid_context(related_conversations)
                 messages.append(SystemMessage(content=retrieval_context))
             else:
-                print(
-                    f"[hybrid_filter] skipped retrieval context | "
-                    f"top_score={top_hybrid_score:.3f} < threshold={threshold:.3f}"
-                )
+                log_hybrid_filter_skipped(top_hybrid_score, threshold)
         except Exception as exc:
             print(f"Hybrid search failed: {exc}")
 
         return retrieval_context
 
-    async def _invoke_model_with_tools(
+    async def _invoke_model(
         self,
         sanitized_messages: List[Union[HumanMessage, AIMessage, SystemMessage]],
         session_id: Optional[str],
+        prompt: str,
         enable_tools: bool = True,
     ):
         if not enable_tools:
@@ -295,14 +289,20 @@ class AIAgent:
                 return await self.llm.ainvoke(sanitized_messages)
             return await asyncio.to_thread(self.llm.invoke, sanitized_messages)
 
+        llm_with_tools = self.tool_filter.get_bound_llm_for_prompt(
+            prompt,
+            llm=self.llm,
+            bound_tools_cache=self._bound_tools_cache,
+            max_rounds=MAX_TOOL_ROUNDS,
+        )
         conversation_for_model = list(sanitized_messages)
-        max_tool_rounds = 3
+        max_tool_rounds = MAX_TOOL_ROUNDS
         response = None
         for _ in range(max_tool_rounds):
-            if hasattr(self.llm_with_tools, "ainvoke"):
-                response = await self.llm_with_tools.ainvoke(conversation_for_model)
+            if hasattr(llm_with_tools, "ainvoke"):
+                response = await llm_with_tools.ainvoke(conversation_for_model)
             else:
-                response = await asyncio.to_thread(self.llm_with_tools.invoke, conversation_for_model)
+                response = await asyncio.to_thread(llm_with_tools.invoke, conversation_for_model)
 
             tool_calls = getattr(response, "tool_calls", None) or []
             if not tool_calls:
@@ -401,33 +401,26 @@ class AIAgent:
             if text:
                 sanitized_messages.append(message)
 
-        estimated_input_tokens = _estimate_token_count(sanitized_messages)
-        print(
-            f"[token_estimate] input~{estimated_input_tokens} tokens | "
-            f"messages={len(sanitized_messages)} | hybrid_used={bool(retrieval_context)}"
-        )
+        estimated_input_tokens = estimate_token_count(sanitized_messages, _extract_text)
+        log_token_estimate_input(estimated_input_tokens, len(sanitized_messages), bool(retrieval_context))
 
-        enable_tools = _should_enable_tools(prompt)
-        response = await self._invoke_model_with_tools(
+        enable_tools = self.tool_filter.should_invoke_with_tools(prompt, min_score=TOOL_FILTER_MIN_SCORE)
+        response = await self._invoke_model(
             sanitized_messages,
             session_id,
+            prompt,
             enable_tools=enable_tools,
         )
 
-        if hasattr(response, "usage_metadata"):
-            print(f"[token_usage] {response.usage_metadata}")
-        elif hasattr(response, "response_metadata"):
-            usage = getattr(response, "response_metadata", {}).get("usage_metadata")
-            if usage:
-                print(f"[token_usage] {usage}")
+        log_token_usage(response)
 
         if hasattr(response, "content"):
             output = _extract_text(response.content)
-            print(f"[token_estimate] output~{max(1, len(output) // 4)} tokens")
+            log_token_estimate_output(output)
             return output
 
         output = _extract_text(response)
-        print(f"[token_estimate] output~{max(1, len(output) // 4)} tokens")
+        log_token_estimate_output(output)
         return output
 
     async def generate_embedding(self, text: str):
@@ -451,3 +444,80 @@ class AIAgent:
     def close(self):
         """Clean up resources."""
         self.store.close()
+
+
+class ToolFilter:
+    """Filter to determine if a tool should be invoked based on the prompt."""
+
+    def __init__(self):
+        self.llm = SentenceTransformer("all-MiniLM-L6-v2")
+
+        self.tool_library = tools_list
+        self.tool_embeddings = self.llm.encode([tool.description for tool in self.tool_library], convert_to_tensor=True)
+
+    def has_tool_intent(self, prompt: str) -> bool:
+        text = _extract_text(prompt).strip().lower()
+        if not text:
+            return False
+
+        if detect_command_registration(text) or detect_command_lookup(text):
+            return True
+
+        return bool(TOOL_INTENT_RE.search(text))
+
+    def should_invoke_with_tools(self, prompt: str, min_score: float) -> bool:
+        """Route to tool-bound model only when intent and relevance both indicate tool use."""
+        if not self.has_tool_intent(prompt):
+            return False
+
+        try:
+            top_score = self.get_top_score(prompt)
+            decision = top_score >= min_score
+            log_tool_router_decision(top_score, min_score, decision)
+            return decision
+        except Exception as exc:
+            # If the filter fails, keep existing behavior for explicit tool intents.
+            log_tool_router_fallback(exc)
+            return True
+
+    def get_bound_llm_for_prompt(self, prompt: str, llm, bound_tools_cache: dict, max_rounds: int = MAX_TOOL_ROUNDS):
+        """Bind only top relevant tools for this prompt, with safe fallbacks and cache."""
+        selected_tools = self.tool_library
+        selected_tool_names = [tool.name for tool in self.tool_library]
+
+        try:
+            filtered_tools = self.get_relevant_tools(prompt, max_rounds=max_rounds)
+            if filtered_tools:
+                selected_tools = filtered_tools
+                selected_tool_names = [tool.name for tool in filtered_tools]
+        except Exception as exc:
+            log_tool_filter_fallback(exc)
+
+        cache_key = tuple(sorted(selected_tool_names))
+        if cache_key not in bound_tools_cache:
+            bound_tools_cache[cache_key] = llm.bind_tools(selected_tools)
+
+        log_tool_filter_selected(selected_tool_names)
+        return bound_tools_cache[cache_key]
+
+    def get_relevant_tools(self, prompt, max_rounds: int = MAX_TOOL_ROUNDS):
+        """Filter tools based on the prompt."""
+        prompt_embedding = self.llm.encode(prompt, convert_to_tensor=True)
+        cosine_scores = util.cos_sim(prompt_embedding, self.tool_embeddings)[0]
+        k = max(1, min(max_rounds, len(self.tool_library)))
+        top_tools = cosine_scores.topk(k)
+        return [self.tool_library[i] for i in top_tools.indices]
+
+    def get_top_score(self, prompt) -> float:
+        """Return top cosine similarity between prompt and tool descriptions."""
+        if not self.tool_library:
+            return 0.0
+
+        prompt_embedding = self.llm.encode(prompt, convert_to_tensor=True)
+        cosine_scores = util.cos_sim(prompt_embedding, self.tool_embeddings)[0]
+        return float(cosine_scores.max().item())
+
+    def get_relevant_tool_names(self, prompt, max_rounds: int = MAX_TOOL_ROUNDS):
+        """Filter tools based on the prompt."""
+        return [tool.name for tool in self.get_relevant_tools(prompt, max_rounds)]
+
