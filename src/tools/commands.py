@@ -37,7 +37,6 @@ def _ensure_command_memory_table(conn):
                 trigger_text TEXT NOT NULL,
                 normalized_trigger TEXT NOT NULL,
                 response_text TEXT NOT NULL,
-                usage_count INTEGER NOT NULL DEFAULT 1,
                 first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (session_id, normalized_trigger, response_text)
@@ -47,7 +46,7 @@ def _ensure_command_memory_table(conn):
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS command_memory_lookup_idx
-            ON command_memory (session_id, normalized_trigger, usage_count DESC)
+            ON command_memory (session_id, normalized_trigger, last_seen_at DESC)
             """
         )
     conn.commit()
@@ -116,14 +115,12 @@ def _save_command_row(conn, session_id: str, command_key: str, response_text: st
                 trigger_text,
                 normalized_trigger,
                 response_text,
-                usage_count,
                 first_seen_at,
                 last_seen_at
             )
-            VALUES (%s, %s, %s, %s, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT (session_id, normalized_trigger, response_text)
             DO UPDATE SET
-                usage_count = command_memory.usage_count + 1,
                 trigger_text = EXCLUDED.trigger_text,
                 last_seen_at = CURRENT_TIMESTAMP
             """,
@@ -136,11 +133,11 @@ def _lookup_command_row(conn, session_id: str, command_key: str):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT response_text, usage_count
+            SELECT response_text
             FROM command_memory
             WHERE session_id = %s
               AND normalized_trigger = %s
-            ORDER BY usage_count DESC, last_seen_at DESC, id DESC
+            ORDER BY last_seen_at DESC, id DESC
             LIMIT 1
             """,
             (session_id, command_key),
@@ -182,8 +179,8 @@ def use_command(command: str, session_id: str = "global") -> str:
             _ensure_command_memory_table(conn)
             result = _lookup_command_row(conn, session_id, normalized)
             if result:
-                response_text, usage_count = result
-                return f"Command found: {normalized} | usage_count={usage_count} | response={response_text}"
+                response_text = result[0]
+                return f"Command found: {normalized} | response={response_text}"
             return "Command not found."
         finally:
             conn.close()

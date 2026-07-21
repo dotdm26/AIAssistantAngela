@@ -14,8 +14,6 @@ from pydantic import BaseModel, Field
 
 from src.config import (
     COMMAND_MEMORY_MAX_PROMPT_LEN,
-    COMMAND_MEMORY_MIN_SHARE,
-    COMMAND_MEMORY_MIN_USAGE,
     GOOGLE_API_KEY,
     LOCAL_EMBEDDING_MODEL,
     HYBRID_TOP_K,
@@ -185,13 +183,10 @@ class AIAgent:
         command_response = self.store.resolve_command_memory(
             session_id,
             command_key,
-            min_usage=COMMAND_MEMORY_MIN_USAGE,
-            min_share=COMMAND_MEMORY_MIN_SHARE,
         )
         if command_response:
             print(
-                f"[command_memory] resolved exact command | prompt={command_key!r} "
-                f"min_usage={COMMAND_MEMORY_MIN_USAGE} min_share={COMMAND_MEMORY_MIN_SHARE:.2f}"
+                f"[command_memory] resolved exact command | prompt={command_key!r}"
             )
             return command_response
 
