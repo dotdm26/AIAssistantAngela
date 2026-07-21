@@ -154,7 +154,6 @@ class ConversationStore:
                     trigger_text TEXT NOT NULL,
                     normalized_trigger TEXT NOT NULL,
                     response_text TEXT NOT NULL,
-                    usage_count INTEGER NOT NULL DEFAULT 1,
                     first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (session_id, normalized_trigger, response_text)
@@ -164,7 +163,7 @@ class ConversationStore:
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS command_memory_lookup_idx
-                ON command_memory (session_id, normalized_trigger, usage_count DESC)
+                ON command_memory (session_id, normalized_trigger, last_seen_at DESC)
                 """
             )
             self.db_connection.commit()
@@ -180,7 +179,6 @@ class ConversationStore:
                     trigger_text,
                     normalized_trigger,
                     response_text,
-                    usage_count,
                     first_seen_at,
                     last_seen_at
                 )
@@ -189,7 +187,6 @@ class ConversationStore:
                     min(trim(user_message)) AS trigger_text,
                     lower(trim(user_message)) AS normalized_trigger,
                     agent_response AS response_text,
-                    COUNT(*) AS usage_count,
                     min(created_at) AS first_seen_at,
                     max(created_at) AS last_seen_at
                 FROM conversations
@@ -388,8 +385,6 @@ class ConversationStore:
         self,
         session_id: str,
         prompt: str,
-        min_usage: int,
-        min_share: float,
     ) -> Optional[str]:
         """Return a stable command response when one response clearly dominates a short trigger."""
         normalized_prompt = (prompt or "").strip().lower()
@@ -402,16 +397,14 @@ class ConversationStore:
                 WITH ranked AS (
                     SELECT
                         response_text,
-                        usage_count,
-                        SUM(usage_count) OVER () AS total_usage,
                         ROW_NUMBER() OVER (
-                            ORDER BY usage_count DESC, last_seen_at DESC, id DESC
+                            ORDER BY last_seen_at DESC, id DESC
                         ) AS rank_index
                     FROM command_memory
                     WHERE session_id = %s
                       AND normalized_trigger = %s
                 )
-                SELECT response_text, usage_count, total_usage
+                SELECT response_text
                 FROM ranked
                 WHERE rank_index = 1
                 """,
@@ -419,17 +412,7 @@ class ConversationStore:
             )
             row = cursor.fetchone()
 
-        if not row:
-            return None
-
-        response_text, usage_count, total_usage = row
-        if usage_count < min_usage or not total_usage:
-            return None
-
-        if (usage_count / total_usage) < min_share:
-            return None
-
-        return response_text
+        return row[0] if row else None
 
     def record_command_memory(self, session_id: str, user_message: str, agent_response: str):
         normalized_trigger = (user_message or "").strip().lower()
@@ -444,14 +427,12 @@ class ConversationStore:
                     trigger_text,
                     normalized_trigger,
                     response_text,
-                    usage_count,
                     first_seen_at,
                     last_seen_at
                 )
-                VALUES (%s, %s, %s, %s, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT (session_id, normalized_trigger, response_text)
                 DO UPDATE SET
-                    usage_count = command_memory.usage_count + 1,
                     trigger_text = EXCLUDED.trigger_text,
                     last_seen_at = CURRENT_TIMESTAMP
                 """,

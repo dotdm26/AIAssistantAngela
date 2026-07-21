@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from sentence_transformers import SentenceTransformer, util
 from src.utils.config import (
+    COMMAND_MEMORY_MAX_PROMPT_LEN,
     GOOGLE_API_KEY,
     LOCAL_EMBEDDING_MODEL,
     HYBRID_TOP_K,
@@ -16,12 +17,13 @@ from src.utils.config import (
     HYBRID_EXCLUDE_RECENT_COUNT,
     HYBRID_MIN_SCORE,
     HYBRID_MIN_SCORE_MEMORY,
-    COMMAND_MEMORY_MAX_PROMPT_LEN,
-    COMMAND_MEMORY_MIN_USAGE,
-    COMMAND_MEMORY_MIN_SHARE,
     MAX_TOOL_ROUNDS,
     TOOL_FILTER_MIN_SCORE,
 )
+
+# Avoid HF Xet/CAS path issues in some environments (401 Unauthorized on public repos).
+# os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 from src.conversation_store import ConversationStore
 from src.utils.embeddings import LocalNomicEmbeddings, detect_embedding_dimension
 from src.utils.prompts import build_system_prompt, configure_formatting
@@ -210,13 +212,10 @@ class AIAgent:
         command_response = self.store.resolve_command_memory(
             session_id,
             command_key,
-            min_usage=COMMAND_MEMORY_MIN_USAGE,
-            min_share=COMMAND_MEMORY_MIN_SHARE,
         )
         if command_response:
             print(
-                f"[command_memory] resolved exact command | prompt={command_key!r} "
-                f"min_usage={COMMAND_MEMORY_MIN_USAGE} min_share={COMMAND_MEMORY_MIN_SHARE:.2f}"
+                f"[command_memory] resolved exact command | prompt={command_key!r}"
             )
             return command_response
 
