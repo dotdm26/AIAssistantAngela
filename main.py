@@ -90,6 +90,13 @@ async def handle_user_message(message):
     history = prepare_history(user_key)
     agent.conversation_history[user_key] = history
 
+    if agent.should_enable_tools(prompt):
+        try:
+            ack_text = await agent.generate_tool_acknowledgement(prompt)
+        except Exception:
+            ack_text = "Got it. Working on that now..."
+        await message.channel.send(trim_for_discord(ack_text))
+
     reply_text = await agent.generate_reply(history, prompt, session_id=user_key)
     if not reply_text:
         await message.channel.send("Sorry, I didn't get a usable reply from the model.")
