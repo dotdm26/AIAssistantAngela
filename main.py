@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
 settings = Settings()
 agent = AIAgent()
-HISTORY_LIMIT = max(1, int(os.getenv("HISTORY_LIMIT", "10")))
+HISTORY_LIMIT = max(1, int(os.getenv("HISTORY_LIMIT", "5")))
 
 intents = discord.Intents.default()
 intents.message_content = True

@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from sentence_transformers import SentenceTransformer, util
-from src.utils.prompts import tool_acknowledgement_prompt
 from src.utils.config import (
     COMMAND_MEMORY_MAX_PROMPT_LEN,
     GOOGLE_API_KEY,
@@ -40,6 +39,7 @@ from src.utils.trackers import (
     log_tool_router_fallback,
 )
 from src.tools.general_tools import general_tools_list
+from src.tools.web_search_tools import web_search_tools
 from src.tools.commands import (
     commands_list,
     detect_command_registration,
@@ -59,7 +59,7 @@ MEMORY_INTENT_RE = re.compile(
     r"\b(remind|remember|earlier|previous|before|last time|you said|we said|continue|recap|summary|what did i)\b"
 )
 TOOL_INTENT_RE = re.compile(
-    r"\b(calendar|event|schedule|meeting|reminder|time|date|gmail|email|mail|inbox|message|messages|label|labels|draft|run|execute|use command|/\w+)\b"
+    r"\b(calendar|event|schedule|meeting|reminder|time|date|gmail|email|mail|inbox|message|messages|label|labels|draft|run|execute|use command|check|search|web|browse|crawl|extract|url|/\w+)\b"
 )
 GMAIL_INTENT_RE = re.compile(
     r"\b(gmail|email|mail|inbox|message|messages|label|labels|draft|send|recipient|subject)\b"
@@ -76,14 +76,22 @@ GMAIL_WRITE_INTENT_RE = re.compile(
 CALENDAR_INTENT_RE = re.compile(
     r"\b(calendar|event|events|schedule|meeting|reminder|appointment)\b"
 )
+WEB_SEARCH_INTENT_RE = re.compile(
+    r"\b(search|web|webpage|internet|browse|look up|lookup|find online|crawl|extract|url|website|news|headline|headlines)\b"
+)
+WEB_DEEPEN_INTENT_RE = re.compile(
+    r"\b(continue|further|deeper|deep|more|latest|current|up to date|update|updated|refresh)\b"
+)
+DOMAIN_PATTERN_RE = re.compile(r"\b(?:https?://)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:/[^\s]*)?\b")
 
 general_tool_names = {tool.name: tool for tool in general_tools_list}
 commands_tool_names = {tool.name: tool for tool in commands_list}
 calendar_tool_names = {tool.name: tool for tool in calendar_tools_list}
 gmail_tools_list = gmail_read_tools_list + gmail_label_tools_list + gmail_write_tools_list
 gmail_tool_names = {tool.name: tool for tool in gmail_tools_list}
+web_search_tool_names = {tool.name: tool for tool in web_search_tools}
 
-tools_list = general_tools_list + commands_list + calendar_tools_list + gmail_tools_list
+tools_list = general_tools_list + commands_list + calendar_tools_list + gmail_tools_list + web_search_tools
 
 READ_ONLY_TOOL_NAMES = {
     "use_command",
@@ -160,6 +168,15 @@ def _format_hybrid_context(results) -> str:
 def _tool_is_read_only(tool_name: str) -> bool:
     return tool_name in READ_ONLY_TOOL_NAMES
 
+
+def _extract_domains_from_text(text: str) -> List[str]:
+    domains = []
+    for match in DOMAIN_PATTERN_RE.finditer((text or "").lower()):
+        domain = match.group(1).strip(". ")
+        if domain and domain not in domains:
+            domains.append(domain)
+    return domains
+
 class AIAgent:
     def __init__(self):
         
@@ -170,12 +187,13 @@ class AIAgent:
         self.llm_gmail_read = self.llm.bind_tools(gmail_read_tools_list)
         self.llm_gmail_label = self.llm.bind_tools(gmail_label_tools_list)
         self.llm_gmail_write = self.llm.bind_tools(gmail_write_tools_list)
+        self.llm_web_search = self.llm.bind_tools(web_search_tools)
         self.tool_filter = ToolFilter()
         self._bound_tools_cache = {}
         self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
         self.embedding_dim = detect_embedding_dimension(self.embeddings)
         self.conversation_history = {}
-        self.tools_by_name = {**general_tool_names, **commands_tool_names, **calendar_tool_names, **gmail_tool_names}
+        self.tools_by_name = {**general_tool_names, **commands_tool_names, **calendar_tool_names, **gmail_tool_names, **web_search_tool_names}
 
         self.store = ConversationStore(
             database_url=os.getenv("DATABASE_URL"),
@@ -204,6 +222,9 @@ class AIAgent:
         if CALENDAR_INTENT_RE.search(prompt_text):
             return self.llm_calendar
 
+        if WEB_SEARCH_INTENT_RE.search(prompt_text):
+            return self.llm_web_search
+
         return self.tool_filter.get_bound_llm_for_prompt(
             prompt,
             llm=self.llm,
@@ -214,23 +235,6 @@ class AIAgent:
     def should_enable_tools(self, prompt: str) -> bool:
         """Public helper for callers to detect whether this prompt is likely to trigger tools."""
         return self.tool_filter.has_tool_intent(prompt)
-
-    async def generate_tool_acknowledgement(self, prompt: str) -> str:
-        """Generate a brief acknowledgement for likely tool-calling turns."""
-        ack_messages = [
-            SystemMessage(
-                content=tool_acknowledgement_prompt()
-            ),
-            HumanMessage(content=prompt),
-        ]
-
-        if hasattr(self.llm, "ainvoke"):
-            response = await self.llm.ainvoke(ack_messages)
-        else:
-            response = await asyncio.to_thread(self.llm.invoke, ack_messages)
-
-        text = _extract_text(getattr(response, "content", response))
-        return text or "Got it. Working on that now..."
 
     def get_conversation_history(
         self,
@@ -340,9 +344,17 @@ class AIAgent:
             return await asyncio.to_thread(self.llm.invoke, sanitized_messages)
 
         llm_with_tools = self._get_llm_with_tools_for_prompt(prompt)
+        prompt_text = _extract_text(prompt).strip().lower()
+        is_web_prompt = bool(WEB_SEARCH_INTENT_RE.search(prompt_text))
+        is_web_deepen_prompt = bool(is_web_prompt and WEB_DEEPEN_INTENT_RE.search(prompt_text))
         conversation_for_model = list(sanitized_messages)
         max_tool_rounds = MAX_TOOL_ROUNDS
+        if is_web_deepen_prompt:
+            max_tool_rounds = max(max_tool_rounds, 4)
+        elif is_web_prompt:
+            max_tool_rounds = max(max_tool_rounds, 3)
         response = None
+        saw_tool_call = False
         for _ in range(max_tool_rounds):
             if hasattr(llm_with_tools, "ainvoke"):
                 response = await llm_with_tools.ainvoke(conversation_for_model)
@@ -352,6 +364,8 @@ class AIAgent:
             tool_calls = getattr(response, "tool_calls", None) or []
             if not tool_calls:
                 break
+
+            saw_tool_call = True
 
             conversation_for_model.append(response)
             can_parallelize = all(_tool_is_read_only(tool_call.get("name", "")) for tool_call in tool_calls)
@@ -414,6 +428,56 @@ class AIAgent:
                         tool_call_id=tool_id,
                     )
                 )
+
+        # Hard fallback for explicit web prompts when model skips tool calls.
+        # This guarantees at least one live web lookup before responding.
+        if is_web_prompt and not saw_tool_call:
+            forced_tool_output = ""
+            forced_tool = self.tools_by_name.get("search_web")
+            if forced_tool is not None:
+                force_args = {
+                    "query": prompt,
+                    "search_depth": "advanced" if is_web_deepen_prompt else "basic",
+                    "include_answer": True,
+                }
+                domains = _extract_domains_from_text(prompt_text)
+                if domains:
+                    force_args["include_domains"] = domains
+
+                try:
+                    forced_tool_output = await asyncio.to_thread(forced_tool.invoke, force_args)
+                except Exception as exc:
+                    forced_tool_output = f"Tool execution error: {exc}"
+
+            forced_synthesis_messages = list(sanitized_messages)
+            forced_synthesis_messages.append(
+                SystemMessage(
+                    content=(
+                        "You must ground your answer in the provided live web search result. "
+                        "If the result is insufficient, say what is missing and suggest a narrower follow-up query."
+                    )
+                )
+            )
+            forced_synthesis_messages.append(
+                HumanMessage(
+                    content=(
+                        f"User request:\n{prompt}\n\n"
+                        f"Live web search result:\n{forced_tool_output}"
+                    )
+                )
+            )
+            if hasattr(self.llm, "ainvoke"):
+                response = await self.llm.ainvoke(forced_synthesis_messages)
+            else:
+                response = await asyncio.to_thread(self.llm.invoke, forced_synthesis_messages)
+
+        # If we exhausted rounds while the model was still requesting tools,
+        # force one synthesis pass to avoid returning a tool-call payload.
+        if response is not None and (getattr(response, "tool_calls", None) or []):
+            if hasattr(self.llm, "ainvoke"):
+                response = await self.llm.ainvoke(conversation_for_model)
+            else:
+                response = await asyncio.to_thread(self.llm.invoke, conversation_for_model)
 
         if response is None:
             raise RuntimeError("No model response received")
@@ -512,6 +576,14 @@ class ToolFilter:
 
     def should_invoke_with_tools(self, prompt: str, min_score: float) -> bool:
         """Route to tool-bound model only when intent and relevance both indicate tool use."""
+        text = _extract_text(prompt).strip().lower()
+
+        if detect_command_registration(text) or detect_command_lookup(text):
+            return True
+
+        if WEB_SEARCH_INTENT_RE.search(text) or GMAIL_INTENT_RE.search(text) or CALENDAR_INTENT_RE.search(text):
+            return True
+
         if not self.has_tool_intent(prompt):
             return False
 
@@ -533,6 +605,7 @@ class ToolFilter:
         prompt_text = _extract_text(prompt).strip().lower()
         force_gmail_tools = bool(GMAIL_INTENT_RE.search(prompt_text))
         force_calendar_tools = bool(CALENDAR_INTENT_RE.search(prompt_text))
+        force_web_tools = bool(WEB_SEARCH_INTENT_RE.search(prompt_text))
 
         try:
             filtered_tools = self.get_relevant_tools(prompt, max_rounds=max_rounds)
@@ -550,6 +623,13 @@ class ToolFilter:
             if force_calendar_tools:
                 by_name = {tool.name: tool for tool in selected_tools}
                 for tool in calendar_tools_list:
+                    by_name.setdefault(tool.name, tool)
+                selected_tools = list(by_name.values())
+                selected_tool_names = [tool.name for tool in selected_tools]
+
+            if force_web_tools:
+                by_name = {tool.name: tool for tool in selected_tools}
+                for tool in web_search_tools:
                     by_name.setdefault(tool.name, tool)
                 selected_tools = list(by_name.values())
                 selected_tool_names = [tool.name for tool in selected_tools]
