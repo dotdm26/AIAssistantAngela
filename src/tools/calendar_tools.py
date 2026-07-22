@@ -1,6 +1,4 @@
 import datetime
-import zoneinfo
-import os
 import threading
 from pathlib import Path
 import json
@@ -8,9 +6,9 @@ from typing import Optional
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore[import-not-found]
+from googleapiclient.discovery import build  # type: ignore[import-not-found]
+from googleapiclient.errors import HttpError  # type: ignore[import-not-found]
 from langchain_core.tools import tool
 
 # If modifying these scopes, delete the file token.json.
@@ -18,7 +16,7 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 BASE_DIR = Path(__file__).resolve().parent
 CLIENT_SECRETS_PATH = BASE_DIR / "client_secrets.json"
-TOKEN_PATH = BASE_DIR / "token.json"
+TOKEN_PATH = BASE_DIR.parent / "tokens" / "token_calendar.json"
 
 _CACHE_LOCK = threading.RLock()
 _CACHED_CREDENTIALS = None
@@ -48,9 +46,9 @@ def _get_credentials() -> Credentials:
         f"Expected at: {CLIENT_SECRETS_PATH}"
     )
 
-  # The file token.json stores the user's access and refresh tokens, and is
-  # created automatically when the authorization flow completes for the first
-  # time.
+  # Token stores the user's access and refresh credentials for calendar scopes.
+  TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+
   if TOKEN_PATH.exists():
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
   # If there are no (valid) credentials available, let the user log in.
@@ -61,9 +59,13 @@ def _get_credentials() -> Credentials:
       flow = InstalledAppFlow.from_client_secrets_file(
           str(CLIENT_SECRETS_PATH), SCOPES
       )
-      creds = flow.run_local_server(port=0)
+      try:
+        # Works better in remote/WSL sessions where browser auto-launch may fail.
+        creds = flow.run_local_server(port=0, open_browser=False)
+      except Exception:
+        creds = flow.run_console()
 
-    with open(TOKEN_PATH, "w") as token:
+    with open(TOKEN_PATH, "w", encoding="utf-8") as token:
       token.write(creds.to_json())
 
   with _CACHE_LOCK:
@@ -148,15 +150,6 @@ def _build_reminders_payload(reminders: Optional[list]) -> Optional[dict]:
     overrides.append({"method": method, "minutes": minutes_int})
 
   return {"useDefault": False, "overrides": overrides}
-
-@tool
-def get_time() -> str:
-  """Get the current time in ISO format for Europe/London timezone."""
-  try:
-    now = datetime.datetime.now(tz=zoneinfo.ZoneInfo("Europe/London"))
-    return now.isoformat()
-  except Exception as error:
-    return json.dumps({"error": str(error)})
 
 @tool
 def list_calendars() -> str:
@@ -337,7 +330,6 @@ def delete_calendar_event(calendar_id: str = "primary", event_id: str = "") -> s
 
 
 calendar_tools_list = [
-  get_time,
   list_calendars,
   get_upcoming_calendar_events,
   get_calendar_events_between,

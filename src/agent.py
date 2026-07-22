@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from sentence_transformers import SentenceTransformer, util
+from src.utils.prompts import tool_acknowledgement_prompt
 from src.utils.config import (
     COMMAND_MEMORY_MAX_PROMPT_LEN,
     GOOGLE_API_KEY,
@@ -38,6 +39,7 @@ from src.utils.trackers import (
     log_tool_router_decision,
     log_tool_router_fallback,
 )
+from src.tools.general_tools import general_tools_list
 from src.tools.commands import (
     commands_list,
     detect_command_registration,
@@ -45,6 +47,11 @@ from src.tools.commands import (
     is_command_candidate,
 )
 from src.tools.calendar_tools import calendar_tools_list
+from src.tools.gmail_tools import (
+    gmail_label_tools_list,
+    gmail_read_tools_list,
+    gmail_write_tools_list,
+)
 
 load_dotenv()
 
@@ -52,13 +59,31 @@ MEMORY_INTENT_RE = re.compile(
     r"\b(remind|remember|earlier|previous|before|last time|you said|we said|continue|recap|summary|what did i)\b"
 )
 TOOL_INTENT_RE = re.compile(
-    r"\b(calendar|event|schedule|meeting|reminder|time|date|run|execute|use command|/\w+)\b"
+    r"\b(calendar|event|schedule|meeting|reminder|time|date|gmail|email|mail|inbox|message|messages|label|labels|draft|run|execute|use command|/\w+)\b"
+)
+GMAIL_INTENT_RE = re.compile(
+    r"\b(gmail|email|mail|inbox|message|messages|label|labels|draft|send|recipient|subject)\b"
+)
+GMAIL_READ_INTENT_RE = re.compile(
+    r"\b(gmail|email|mail|inbox|message|messages|search|find|list|read)\b"
+)
+GMAIL_LABEL_INTENT_RE = re.compile(
+    r"\b(label|labels|tag|tags|categorize|category)\b"
+)
+GMAIL_WRITE_INTENT_RE = re.compile(
+    r"\b(send|draft|compose|write|reply|forward|recipient|subject)\b"
+)
+CALENDAR_INTENT_RE = re.compile(
+    r"\b(calendar|event|events|schedule|meeting|reminder|appointment)\b"
 )
 
+general_tool_names = {tool.name: tool for tool in general_tools_list}
 commands_tool_names = {tool.name: tool for tool in commands_list}
 calendar_tool_names = {tool.name: tool for tool in calendar_tools_list}
+gmail_tools_list = gmail_read_tools_list + gmail_label_tools_list + gmail_write_tools_list
+gmail_tool_names = {tool.name: tool for tool in gmail_tools_list}
 
-tools_list = commands_list + calendar_tools_list
+tools_list = general_tools_list + commands_list + calendar_tools_list + gmail_tools_list
 
 READ_ONLY_TOOL_NAMES = {
     "use_command",
@@ -66,6 +91,9 @@ READ_ONLY_TOOL_NAMES = {
     "list_calendars",
     "get_upcoming_calendar_events",
     "get_calendar_events_between",
+    "gmail_list_messages",
+    "gmail_search_messages",
+    "gmail_list_labels",
 }
 
 
@@ -136,14 +164,18 @@ class AIAgent:
     def __init__(self):
         
         self.llm = ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model="gemini-3.1-flash-lite")
+        self.llm_general = self.llm.bind_tools(general_tools_list)
         self.llm_commands = self.llm.bind_tools(commands_list)
         self.llm_calendar = self.llm.bind_tools(calendar_tools_list)
+        self.llm_gmail_read = self.llm.bind_tools(gmail_read_tools_list)
+        self.llm_gmail_label = self.llm.bind_tools(gmail_label_tools_list)
+        self.llm_gmail_write = self.llm.bind_tools(gmail_write_tools_list)
         self.tool_filter = ToolFilter()
         self._bound_tools_cache = {}
         self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
         self.embedding_dim = detect_embedding_dimension(self.embeddings)
         self.conversation_history = {}
-        self.tools_by_name = {**commands_tool_names, **calendar_tool_names}
+        self.tools_by_name = {**general_tool_names, **commands_tool_names, **calendar_tool_names, **gmail_tool_names}
 
         self.store = ConversationStore(
             database_url=os.getenv("DATABASE_URL"),
@@ -156,6 +188,29 @@ class AIAgent:
         # Agent configuration
         self.system_prompt = build_system_prompt(os.getenv("EXTRA_INSTRUCTIONS"))
 
+    def _get_llm_with_tools_for_prompt(self, prompt: str):
+        """Choose a domain-specific tool-bound LLM to keep tool lists small and fast."""
+        prompt_text = _extract_text(prompt).strip().lower()
+
+        if GMAIL_INTENT_RE.search(prompt_text):
+            if GMAIL_LABEL_INTENT_RE.search(prompt_text):
+                return self.llm_gmail_label
+            if GMAIL_WRITE_INTENT_RE.search(prompt_text):
+                return self.llm_gmail_write
+            if GMAIL_READ_INTENT_RE.search(prompt_text):
+                return self.llm_gmail_read
+            return self.llm_gmail_read
+
+        if CALENDAR_INTENT_RE.search(prompt_text):
+            return self.llm_calendar
+
+        return self.tool_filter.get_bound_llm_for_prompt(
+            prompt,
+            llm=self.llm,
+            bound_tools_cache=self._bound_tools_cache,
+            max_rounds=MAX_TOOL_ROUNDS,
+        )
+
     def should_enable_tools(self, prompt: str) -> bool:
         """Public helper for callers to detect whether this prompt is likely to trigger tools."""
         return self.tool_filter.has_tool_intent(prompt)
@@ -164,11 +219,7 @@ class AIAgent:
         """Generate a brief acknowledgement for likely tool-calling turns."""
         ack_messages = [
             SystemMessage(
-                content=(
-                    "Write one short acknowledgement sentence (max 12 words). Keep your response in bold by adding ** around the text. "
-                    "Confirm you are working on the user's request now. "
-                    "Do not ask questions."
-                )
+                content=tool_acknowledgement_prompt()
             ),
             HumanMessage(content=prompt),
         ]
@@ -288,12 +339,7 @@ class AIAgent:
                 return await self.llm.ainvoke(sanitized_messages)
             return await asyncio.to_thread(self.llm.invoke, sanitized_messages)
 
-        llm_with_tools = self.tool_filter.get_bound_llm_for_prompt(
-            prompt,
-            llm=self.llm,
-            bound_tools_cache=self._bound_tools_cache,
-            max_rounds=MAX_TOOL_ROUNDS,
-        )
+        llm_with_tools = self._get_llm_with_tools_for_prompt(prompt)
         conversation_for_model = list(sanitized_messages)
         max_tool_rounds = MAX_TOOL_ROUNDS
         response = None
@@ -484,11 +530,29 @@ class ToolFilter:
         selected_tools = self.tool_library
         selected_tool_names = [tool.name for tool in self.tool_library]
 
+        prompt_text = _extract_text(prompt).strip().lower()
+        force_gmail_tools = bool(GMAIL_INTENT_RE.search(prompt_text))
+        force_calendar_tools = bool(CALENDAR_INTENT_RE.search(prompt_text))
+
         try:
             filtered_tools = self.get_relevant_tools(prompt, max_rounds=max_rounds)
             if filtered_tools:
                 selected_tools = filtered_tools
                 selected_tool_names = [tool.name for tool in filtered_tools]
+
+            if force_gmail_tools:
+                by_name = {tool.name: tool for tool in selected_tools}
+                for tool in gmail_tools_list:
+                    by_name.setdefault(tool.name, tool)
+                selected_tools = list(by_name.values())
+                selected_tool_names = [tool.name for tool in selected_tools]
+
+            if force_calendar_tools:
+                by_name = {tool.name: tool for tool in selected_tools}
+                for tool in calendar_tools_list:
+                    by_name.setdefault(tool.name, tool)
+                selected_tools = list(by_name.values())
+                selected_tool_names = [tool.name for tool in selected_tools]
         except Exception as exc:
             log_tool_filter_fallback(exc)
 

@@ -2,7 +2,7 @@
 notes.txt
 diary.txt
 src/tools/client_secrets.json
-src/tools/token.json
+src/tokens
 .venv/
 path/
 __pycache__/
