@@ -9,10 +9,6 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from sentence_transformers import SentenceTransformer, util
 from src.utils.config import (
-    COMMAND_MEMORY_MAX_PROMPT_LEN,
-    COMMAND_SEMANTIC_MAX_WORDS,
-    COMMAND_SEMANTIC_MIN_MARGIN,
-    COMMAND_SEMANTIC_MIN_SCORE,
     GOOGLE_API_KEY,
     LOCAL_EMBEDDING_MODEL,
     HYBRID_TOP_K,
@@ -43,12 +39,6 @@ from src.utils.trackers import (
 )
 from src.tools.general_tools import general_tools_list
 from src.tools.web_search_tools import web_search_tools
-from src.tools.commands import (
-    commands_list,
-    detect_command_registration,
-    detect_command_lookup,
-    is_command_candidate,
-)
 from src.tools.calendar_tools import calendar_tools_list
 from src.tools.gmail_tools import (
     gmail_label_tools_list,
@@ -88,16 +78,14 @@ WEB_DEEPEN_INTENT_RE = re.compile(
 DOMAIN_PATTERN_RE = re.compile(r"\b(?:https?://)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:/[^\s]*)?\b")
 
 general_tool_names = {tool.name: tool for tool in general_tools_list}
-commands_tool_names = {tool.name: tool for tool in commands_list}
 calendar_tool_names = {tool.name: tool for tool in calendar_tools_list}
 gmail_tools_list = gmail_read_tools_list + gmail_label_tools_list + gmail_write_tools_list
 gmail_tool_names = {tool.name: tool for tool in gmail_tools_list}
 web_search_tool_names = {tool.name: tool for tool in web_search_tools}
 
-tools_list = general_tools_list + commands_list + calendar_tools_list + gmail_tools_list + web_search_tools
+tools_list = general_tools_list + calendar_tools_list + gmail_tools_list + web_search_tools
 
 READ_ONLY_TOOL_NAMES = {
-    "use_command",
     "get_time",
     "list_calendars",
     "get_upcoming_calendar_events",
@@ -131,25 +119,6 @@ def _extract_text(content):
     if content is None:
         return ""
     return str(content).strip()
-
-
-def _is_command_candidate(text: str) -> bool:
-    return is_command_candidate(text, max_len=COMMAND_MEMORY_MAX_PROMPT_LEN)
-
-
-def _is_semantic_command_candidate(text: str) -> bool:
-    normalized = (text or "").strip()
-    if not normalized:
-        return False
-
-    word_count = len(normalized.split())
-    if word_count > COMMAND_SEMANTIC_MAX_WORDS:
-        return False
-
-    if normalized.endswith("?"):
-        return False
-
-    return True
 
 
 def _looks_like_memory_key(text: str) -> bool:
@@ -200,7 +169,6 @@ class AIAgent:
         
         self.llm = ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model="gemini-3.1-flash-lite")
         self.llm_general = self.llm.bind_tools(general_tools_list)
-        self.llm_commands = self.llm.bind_tools(commands_list)
         self.llm_calendar = self.llm.bind_tools(calendar_tools_list)
         self.llm_gmail_read = self.llm.bind_tools(gmail_read_tools_list)
         self.llm_gmail_label = self.llm.bind_tools(gmail_label_tools_list)
@@ -211,14 +179,13 @@ class AIAgent:
         self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
         self.embedding_dim = detect_embedding_dimension(self.embeddings)
         self.conversation_history = {}
-        self.tools_by_name = {**general_tool_names, **commands_tool_names, **calendar_tool_names, **gmail_tool_names, **web_search_tool_names}
+        self.tools_by_name = {**general_tool_names, **calendar_tool_names, **gmail_tool_names, **web_search_tool_names}
 
         self.store = ConversationStore(
             database_url=os.getenv("DATABASE_URL"),
             embedding_dim=self.embedding_dim,
             local_embedding_model=LOCAL_EMBEDDING_MODEL,
             hybrid_exclude_recent_count=HYBRID_EXCLUDE_RECENT_COUNT,
-            command_memory_max_prompt_len=COMMAND_MEMORY_MAX_PROMPT_LEN,
         )
 
         # Agent configuration
@@ -262,88 +229,6 @@ class AIAgent:
         """Retrieve conversation history for context."""
         return self.store.get_conversation_history(session_id, limit=limit)
 
-    async def _handle_direct_command_intent(self, prompt: str, prompt_text: str, session_id: Optional[str]) -> Optional[str]:
-        if not session_id:
-            return None
-
-        registration = detect_command_registration(prompt)
-        if registration:
-            command_key, command_response = registration
-            await asyncio.to_thread(
-                self.store.record_command_memory,
-                session_id,
-                command_key,
-                command_response,
-            )
-            return f"Registered command '{command_key}'."
-
-        lookup_key = detect_command_lookup(prompt)
-        if lookup_key:
-            command_key = lookup_key
-            command_response = self.store.resolve_command_memory(
-                session_id,
-                command_key,
-            )
-            if command_response:
-                print(
-                    f"[command_memory] resolved exact command | prompt={command_key!r}"
-                )
-                return command_response
-
-            stripped_prompt = prompt.strip()
-            if stripped_prompt.startswith("/") or " " in stripped_prompt:
-                return f"I could not find a registered command for '{lookup_key}'."
-
-        semantic_command_response = await self._resolve_semantic_command_intent(
-            prompt,
-            prompt_text,
-            session_id,
-        )
-        if semantic_command_response is not None:
-            return semantic_command_response
-
-        return None
-
-    async def _resolve_semantic_command_intent(
-        self,
-        prompt: str,
-        prompt_text: str,
-        session_id: Optional[str],
-    ) -> Optional[str]:
-        if not session_id or not _is_semantic_command_candidate(prompt):
-            return None
-
-        if detect_command_registration(prompt) or detect_command_lookup(prompt):
-            return None
-
-        registered_commands = await asyncio.to_thread(self.store.list_registered_commands, session_id)
-        if not registered_commands:
-            return None
-
-        triggers = [row[1] or row[0] for row in registered_commands]
-        if not triggers:
-            return None
-
-        prompt_embedding = self.tool_filter.llm.encode(prompt_text, convert_to_tensor=True)
-        trigger_embeddings = self.tool_filter.llm.encode(triggers, convert_to_tensor=True)
-        cosine_scores = util.cos_sim(prompt_embedding, trigger_embeddings)[0]
-        top_matches = cosine_scores.topk(min(2, len(triggers)))
-        best_index = int(top_matches.indices[0])
-        best_score = float(top_matches.values[0])
-        second_score = float(top_matches.values[1]) if len(triggers) > 1 else 0.0
-        score_margin = best_score - second_score
-
-        if best_score < COMMAND_SEMANTIC_MIN_SCORE or score_margin < COMMAND_SEMANTIC_MIN_MARGIN:
-            return None
-
-        trigger_text, normalized_trigger, response_text = registered_commands[best_index]
-        print(
-            "[command_memory] resolved semantic command "
-            f"| prompt={prompt_text!r} | trigger={normalized_trigger!r} "
-            f"| score={best_score:.3f} | margin={score_margin:.3f}"
-        )
-        return response_text
-
     async def _check_retrieval_context(
         self,
         messages: List[Union[HumanMessage, AIMessage, SystemMessage]],
@@ -354,14 +239,9 @@ class AIAgent:
         if not session_id:
             return ""
 
-        is_session_memory_alias = bool(
-            _is_command_candidate(prompt_text)
-            and self.store.has_exact_user_message(session_id, prompt_text, min_count=2)
-        )
         should_use_hybrid_search = (
             len(prompt_text) >= HYBRID_MIN_PROMPT_CHARS
             or _looks_like_memory_key(prompt_text)
-            or is_session_memory_alias
             or _is_explicit_memory_intent(prompt_text)
         )
         if not should_use_hybrid_search:
@@ -370,7 +250,7 @@ class AIAgent:
         retrieval_context = ""
         try:
             retrieval_limit = HYBRID_TOP_K
-            if _looks_like_memory_key(prompt_text) or is_session_memory_alias:
+            if _looks_like_memory_key(prompt_text):
                 retrieval_limit = max(HYBRID_TOP_K, 10)
 
             related_conversations = await self.store.hybrid_search_conversations(
@@ -382,8 +262,6 @@ class AIAgent:
 
             top_hybrid_score = max((row[4] for row in related_conversations), default=0.0)
             threshold = _hybrid_score_threshold(prompt_text)
-            if is_session_memory_alias:
-                threshold = min(threshold, HYBRID_MIN_SCORE_MEMORY)
 
             if top_hybrid_score >= threshold:
                 retrieval_context = _format_hybrid_context(related_conversations)
@@ -560,10 +438,6 @@ class AIAgent:
         messages = list(history)
         prompt_text = _extract_text(prompt).lower()
 
-        direct_command_response = await self._handle_direct_command_intent(prompt, prompt_text, session_id)
-        if direct_command_response is not None:
-            return direct_command_response
-
         retrieval_context = await self._check_retrieval_context(messages, prompt, prompt_text, session_id)
 
         messages.append(HumanMessage(content=prompt))
@@ -633,17 +507,11 @@ class ToolFilter:
         if not text:
             return False
 
-        if detect_command_registration(text) or detect_command_lookup(text):
-            return True
-
         return bool(TOOL_INTENT_RE.search(text))
 
     def should_invoke_with_tools(self, prompt: str, min_score: float) -> bool:
         """Route to tool-bound model only when intent and relevance both indicate tool use."""
         text = _extract_text(prompt).strip().lower()
-
-        if detect_command_registration(text) or detect_command_lookup(text):
-            return True
 
         if WEB_SEARCH_INTENT_RE.search(text) or GMAIL_INTENT_RE.search(text) or CALENDAR_INTENT_RE.search(text):
             return True

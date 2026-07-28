@@ -86,9 +86,6 @@ HYBRID_TOP_K=5
 HYBRID_EXCLUDE_RECENT_COUNT=4
 HYBRID_MIN_SCORE=0.25
 HYBRID_MIN_SCORE_MEMORY=0.15
-COMMAND_MEMORY_MAX_PROMPT_LEN=16
-COMMAND_MEMORY_MIN_USAGE=2
-COMMAND_MEMORY_MIN_SHARE=0.6
 
 # Optional local embedding model
 LOCAL_EMBEDDING_MODEL="nomic-ai/nomic-embed-text-v1.5"
@@ -152,8 +149,8 @@ If successful, you should see a login message in the console.
 - `src/agent.py`: LLM orchestration, retrieval, and tool execution loop
 - `src/rss.py`: RSS polling loop and Discord posting
 - `src/conversation_store.py`: PostgreSQL storage, schema setup, hybrid search
-- `src/tools/commands.py`: command registration/lookup tools
 - `src/tools/news_feed_tools.py`: feed parsing, dedupe, and article text extraction
+- `src/tools/web_search_tools.py`: search articles on webpages and search engines
 - `src/tools/calendar_tools.py`: Google Calendar tools
 - `src/utils/prompts.py`: system prompt and formatting instructions
 
@@ -202,4 +199,3 @@ Some sites block scraping or return unreadable HTML. In those cases, the bot fal
 
 - Command memory resolution is session-aware.
 - Tool calling supports multiple tools in one conversation turn.
-- Calendar tools currently provide read-only access (no event creation/edit yet).
