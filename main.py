@@ -1,11 +1,13 @@
 import os
 import asyncio
 import discord
+import asyncpg
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 from typing import Optional, Union
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from src.agent import AIAgent
+from src.rss import RSSMonitor
 
 load_dotenv()
 
@@ -13,14 +15,18 @@ class Settings(BaseSettings):
     DISCORD_TOKEN: str
     DISCORD_CHANNEL_ID: Optional[str] = None
     USER_ID: Optional[str] = None
+    DATABASE_URL: Optional[str] = None
+    NEWS_FEED_URL: str = "http://feeds.bbci.co.uk/news/rss.xml"
 
 settings = Settings()
 agent = AIAgent()
-HISTORY_LIMIT = max(1, int(os.getenv("HISTORY_LIMIT", "5")))
+HISTORY_LIMIT = max(1, int(os.getenv("HISTORY_LIMIT", "10")))
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+rss_monitor: Optional[RSSMonitor] = None
+rss_db_pool: Optional[asyncpg.Pool] = None
 
 def get_allowed_values() -> set[str]:
     allowed_values = {os.getenv("user1"), os.getenv("user2")}
@@ -43,6 +49,32 @@ def trim_for_discord(text: str, limit: int = 1990) -> str:
     if len(text) <= limit:
         return text
     return text[:limit - 3] + "..."
+
+
+def _extract_model_text(content) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, dict):
+        text = content.get("text")
+        return text if isinstance(text, str) else ""
+
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                if part.strip():
+                    chunks.append(part.strip())
+                continue
+
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text.strip())
+
+        return "\n".join(chunks)
+
+    return ""
 
 def _log_store_conversation_error(task: asyncio.Task):
     exc = task.exception()
@@ -101,9 +133,86 @@ async def handle_user_message(message):
     schedule_store_conversation(user_key, prompt, reply_text)
 
 
+async def summarize_news_article(article: dict) -> str:
+    title = (article.get("title") or "Untitled").strip()
+    link = (article.get("link") or "").strip()
+    feed_summary = (article.get("summary") or "").strip()
+    content = (article.get("content") or "").strip()
+
+    if not content and not feed_summary:
+        return "No readable content was found for this article."
+
+    source_text = content or feed_summary
+    source_text = source_text[:9000]
+
+    system_text = (
+        "You are Angela chatting directly with the user in Discord about a news article. "
+        "Sound conversational, natural, and personable instead of formal or objective. "
+    )
+    prompt_text = (
+        "Give me a short chat-style summary of this article as if we are talking one-on-one. "
+        "Keep it to about 4-6 sentences. "
+        "Mention the key point, one or two notable details, and why it matters to me. "
+        "Do not use JSON or code blocks.\n\n"
+        f"Title: {title}\n"
+        f"URL: {link}\n\n"
+        f"Article text:\n{source_text}"
+    )
+
+    try:
+        messages = [SystemMessage(content=system_text), HumanMessage(content=prompt_text)]
+        if hasattr(agent.llm, "ainvoke"):
+            response = await agent.llm.ainvoke(messages)
+        else:
+            response = await asyncio.to_thread(agent.llm.invoke, messages)
+
+        clean_summary = _extract_model_text(getattr(response, "content", "")).strip()
+        if not clean_summary:
+            return "Summary unavailable."
+
+        return trim_for_discord(clean_summary, limit=1200)
+    except Exception as exc:
+        print(f"Article summarization failed: {exc}")
+        return "Summary unavailable due to a model error."
+
+
+async def ensure_rss_monitor_started() -> None:
+    global rss_monitor, rss_db_pool
+
+    if rss_monitor is not None:
+        return
+
+    if not settings.DISCORD_CHANNEL_ID:
+        print("RSS monitor not started: DISCORD_CHANNEL_ID is not set.")
+        return
+
+    if not settings.DATABASE_URL:
+        print("RSS monitor not started: DATABASE_URL is not set.")
+        return
+
+    try:
+        rss_db_pool = await asyncpg.create_pool(dsn=settings.DATABASE_URL, min_size=1, max_size=3)
+        rss_monitor = RSSMonitor(
+            bot=client,
+            db_pool=rss_db_pool,
+            channel_id=int(settings.DISCORD_CHANNEL_ID),
+            feed_url=settings.NEWS_FEED_URL,
+            article_summarizer=summarize_news_article,
+        )
+        print(f"RSS monitor started for feed: {settings.NEWS_FEED_URL}")
+    except Exception as exc:
+        rss_monitor = None
+        if rss_db_pool is not None:
+            await rss_db_pool.close()
+            rss_db_pool = None
+        print(f"Failed to start RSS monitor: {exc}")
+
+
 @client.event
 async def on_ready():
     print(f"We have logged in as {client.user}")
+
+    await ensure_rss_monitor_started()
 
     if not settings.DISCORD_CHANNEL_ID:
         print("DISCORD_CHANNEL_ID is not set. Startup greeting skipped.")

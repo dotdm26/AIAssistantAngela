@@ -11,13 +11,26 @@ from langchain_core.tools import tool
 dotenv.load_dotenv()
 
 COMMAND_TOKEN_RE = re.compile(r"^[a-z0-9_-]{2,64}$")
+COMMAND_TRIGGER_MAX_LEN = 120
 
 def _normalize_command_key(text: str) -> str:
-    return (text or "").strip().lower()
+    return re.sub(r"\s+", " ", (text or "").strip()).lower()
 
 
 def _looks_like_command_key(text: str) -> bool:
     return bool(COMMAND_TOKEN_RE.fullmatch(_normalize_command_key(text)))
+
+
+def _looks_like_command_trigger(text: str) -> bool:
+    normalized = _normalize_command_key(text)
+    return bool(normalized and len(normalized) <= COMMAND_TRIGGER_MAX_LEN)
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    stripped = (text or "").strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
+        return stripped[1:-1].strip()
+    return stripped
 
 
 def is_command_candidate(text: str, max_len: int = 64) -> bool:
@@ -59,11 +72,11 @@ def detect_command_registration(message: str):
 
     patterns = [
         re.compile(
-            r"^(?:save|register|add|create)\s+command\s+([a-z0-9_-]{2,64})\s*(?:=>|->|:|=)\s*(.+)$",
+            r"^(?:save|register|add|create)\s+command\s+(.+?)\s*(?:=>|->|:|=)\s*(.+)$",
             re.IGNORECASE,
         ),
         re.compile(
-            r"^(?:when i say|if i say|from now on)\s+([a-z0-9_-]{2,64})\s*,?\s*(?:respond|reply|do|run|execute)\s+(.+)$",
+            r"^(?:when i say|if i say|from now on)\s+(.+?)\s*,?\s*(?:respond|reply|do|run|execute)\s+(.+)$",
             re.IGNORECASE,
         ),
     ]
@@ -73,16 +86,16 @@ def detect_command_registration(message: str):
         if not match:
             continue
 
-        key = _normalize_command_key(match.group(1))
+        key = _normalize_command_key(_strip_wrapping_quotes(match.group(1)))
         value = match.group(2).strip()
-        if _looks_like_command_key(key) and value:
+        if _looks_like_command_trigger(key) and value:
             return key, value
 
     return None
 
 
 def detect_command_lookup(message: str):
-    """Return a command key when user message asks to run/use a command."""
+    """Return a command trigger when user message explicitly asks to run/use a command."""
     text = (message or "").strip()
     if not text:
         return None
@@ -92,18 +105,29 @@ def detect_command_lookup(message: str):
         return _normalize_command_key(slash.group(1))
 
     explicit = re.match(
-        r"^(?:run|use|execute|do)\s+(?:command\s+)?([a-z0-9_-]{2,64})$",
+        r"^(?:run|use|execute|do)\s+(?:command\s+)?(.+)$",
         text,
         re.IGNORECASE,
     )
     if explicit:
-        return _normalize_command_key(explicit.group(1))
+        trigger = _normalize_command_key(_strip_wrapping_quotes(explicit.group(1)))
+        if _looks_like_command_trigger(trigger):
+            return trigger
 
     return None
 
 
 def _save_command_row(conn, session_id: str, command_key: str, response_text: str):
     with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM command_memory
+            WHERE session_id = %s
+              AND normalized_trigger = %s
+              AND response_text <> %s
+            """,
+            (session_id, command_key, response_text),
+        )
         cur.execute(
             """
             INSERT INTO command_memory (
@@ -146,8 +170,8 @@ def save_command(command: str, response_text: str, session_id: str = "global") -
     """Save/register a command and its associated functionality/response."""
     try:
         normalized = _normalize_command_key(command)
-        if not _looks_like_command_key(normalized):
-            return "Invalid command key. Use 2-64 chars: a-z, 0-9, _ or -."
+        if not _looks_like_command_trigger(normalized):
+            return "Invalid command trigger. Use a short phrase up to 120 characters."
         if not (response_text or "").strip():
             return "Command response/functionality cannot be empty."
 
@@ -167,8 +191,8 @@ def use_command(command: str, session_id: str = "global") -> str:
     """Retrieve the most likely functionality/response associated with a command."""
     try:
         normalized = _normalize_command_key(command)
-        if not _looks_like_command_key(normalized):
-            return "Invalid command key."
+        if not _looks_like_command_trigger(normalized):
+            return "Invalid command trigger."
 
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         try:

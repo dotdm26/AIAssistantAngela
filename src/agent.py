@@ -10,6 +10,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from sentence_transformers import SentenceTransformer, util
 from src.utils.config import (
     COMMAND_MEMORY_MAX_PROMPT_LEN,
+    COMMAND_SEMANTIC_MAX_WORDS,
+    COMMAND_SEMANTIC_MIN_MARGIN,
+    COMMAND_SEMANTIC_MIN_SCORE,
     GOOGLE_API_KEY,
     LOCAL_EMBEDDING_MODEL,
     HYBRID_TOP_K,
@@ -132,6 +135,21 @@ def _extract_text(content):
 
 def _is_command_candidate(text: str) -> bool:
     return is_command_candidate(text, max_len=COMMAND_MEMORY_MAX_PROMPT_LEN)
+
+
+def _is_semantic_command_candidate(text: str) -> bool:
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+
+    word_count = len(normalized.split())
+    if word_count > COMMAND_SEMANTIC_MAX_WORDS:
+        return False
+
+    if normalized.endswith("?"):
+        return False
+
+    return True
 
 
 def _looks_like_memory_key(text: str) -> bool:
@@ -259,26 +277,72 @@ class AIAgent:
             )
             return f"Registered command '{command_key}'."
 
-        if not _is_command_candidate(prompt_text):
-            return None
-
         lookup_key = detect_command_lookup(prompt)
-        command_key = lookup_key or prompt_text
-        command_response = self.store.resolve_command_memory(
-            session_id,
-            command_key,
-        )
-        if command_response:
-            print(
-                f"[command_memory] resolved exact command | prompt={command_key!r}"
+        if lookup_key:
+            command_key = lookup_key
+            command_response = self.store.resolve_command_memory(
+                session_id,
+                command_key,
             )
-            return command_response
+            if command_response:
+                print(
+                    f"[command_memory] resolved exact command | prompt={command_key!r}"
+                )
+                return command_response
 
-        stripped_prompt = prompt.strip()
-        if lookup_key and (stripped_prompt.startswith("/") or " " in stripped_prompt):
-            return f"I could not find a registered command for '{lookup_key}'."
+            stripped_prompt = prompt.strip()
+            if stripped_prompt.startswith("/") or " " in stripped_prompt:
+                return f"I could not find a registered command for '{lookup_key}'."
+
+        semantic_command_response = await self._resolve_semantic_command_intent(
+            prompt,
+            prompt_text,
+            session_id,
+        )
+        if semantic_command_response is not None:
+            return semantic_command_response
 
         return None
+
+    async def _resolve_semantic_command_intent(
+        self,
+        prompt: str,
+        prompt_text: str,
+        session_id: Optional[str],
+    ) -> Optional[str]:
+        if not session_id or not _is_semantic_command_candidate(prompt):
+            return None
+
+        if detect_command_registration(prompt) or detect_command_lookup(prompt):
+            return None
+
+        registered_commands = await asyncio.to_thread(self.store.list_registered_commands, session_id)
+        if not registered_commands:
+            return None
+
+        triggers = [row[1] or row[0] for row in registered_commands]
+        if not triggers:
+            return None
+
+        prompt_embedding = self.tool_filter.llm.encode(prompt_text, convert_to_tensor=True)
+        trigger_embeddings = self.tool_filter.llm.encode(triggers, convert_to_tensor=True)
+        cosine_scores = util.cos_sim(prompt_embedding, trigger_embeddings)[0]
+        top_matches = cosine_scores.topk(min(2, len(triggers)))
+        best_index = int(top_matches.indices[0])
+        best_score = float(top_matches.values[0])
+        second_score = float(top_matches.values[1]) if len(triggers) > 1 else 0.0
+        score_margin = best_score - second_score
+
+        if best_score < COMMAND_SEMANTIC_MIN_SCORE or score_margin < COMMAND_SEMANTIC_MIN_MARGIN:
+            return None
+
+        trigger_text, normalized_trigger, response_text = registered_commands[best_index]
+        print(
+            "[command_memory] resolved semantic command "
+            f"| prompt={prompt_text!r} | trigger={normalized_trigger!r} "
+            f"| score={best_score:.3f} | margin={score_margin:.3f}"
+        )
+        return response_text
 
     async def _check_retrieval_context(
         self,
