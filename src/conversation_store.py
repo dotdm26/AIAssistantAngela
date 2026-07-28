@@ -25,7 +25,7 @@ class ConversationStore:
         self._ensure_embedding_column()
         self._ensure_text_search_column()
         self._ensure_command_memory_table()
-        self._rebuild_command_memory_cache()
+        self._dedupe_command_memory_table()
 
     # MANUALLY CREATE THE EXTENSION AS SUPERUSER IN POSTGRESQL BEFORE RUNNING THE BOT,
     # OTHERWISE EMBEDDINGS WILL BE STORED AS JSON.
@@ -168,36 +168,20 @@ class ConversationStore:
             )
             self.db_connection.commit()
 
-    def _rebuild_command_memory_cache(self):
-        """Backfill command memory from existing conversations so old commands resolve immediately."""
+    def _dedupe_command_memory_table(self):
+        """Keep only the most recent version of each command key per session."""
         with self.db_connection.cursor() as cursor:
-            cursor.execute("DELETE FROM command_memory")
             cursor.execute(
                 """
-                INSERT INTO command_memory (
-                    session_id,
-                    trigger_text,
-                    normalized_trigger,
-                    response_text,
-                    first_seen_at,
-                    last_seen_at
-                )
-                SELECT
-                    session_id,
-                    min(trim(user_message)) AS trigger_text,
-                    lower(trim(user_message)) AS normalized_trigger,
-                    agent_response AS response_text,
-                    min(created_at) AS first_seen_at,
-                    max(created_at) AS last_seen_at
-                FROM conversations
-                WHERE coalesce(trim(user_message), '') <> ''
-                  AND position(' ' in trim(user_message)) = 0
-                  AND char_length(trim(user_message)) <= %s
-                  AND trim(user_message) ~ '^[A-Za-z0-9_-]{2,}$'
-                  AND coalesce(agent_response, '') <> ''
-                GROUP BY session_id, lower(trim(user_message)), agent_response
-                """,
-                (self.command_memory_max_prompt_len,),
+                DELETE FROM command_memory cm
+                USING command_memory newer
+                WHERE cm.session_id = newer.session_id
+                  AND cm.normalized_trigger = newer.normalized_trigger
+                  AND (
+                      cm.last_seen_at < newer.last_seen_at
+                      OR (cm.last_seen_at = newer.last_seen_at AND cm.id < newer.id)
+                  )
+                """
             )
             self.db_connection.commit()
 
@@ -414,12 +398,47 @@ class ConversationStore:
 
         return row[0] if row else None
 
+    def list_registered_commands(self, session_id: str):
+        with self.db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        trigger_text,
+                        normalized_trigger,
+                        response_text,
+                        last_seen_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY normalized_trigger
+                            ORDER BY last_seen_at DESC, id DESC
+                        ) AS rank_index
+                    FROM command_memory
+                    WHERE session_id = %s
+                )
+                SELECT trigger_text, normalized_trigger, response_text
+                FROM ranked
+                WHERE rank_index = 1
+                ORDER BY last_seen_at DESC
+                """,
+                (session_id,),
+            )
+            return cursor.fetchall()
+
     def record_command_memory(self, session_id: str, user_message: str, agent_response: str):
         normalized_trigger = (user_message or "").strip().lower()
         if not normalized_trigger or not agent_response:
             return
 
         with self.db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM command_memory
+                WHERE session_id = %s
+                  AND normalized_trigger = %s
+                  AND response_text <> %s
+                """,
+                (session_id, normalized_trigger, agent_response),
+            )
             cursor.execute(
                 """
                 INSERT INTO command_memory (

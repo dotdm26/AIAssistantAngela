@@ -5,6 +5,7 @@ A Discord-based AI assistant that combines:
 - PostgreSQL conversation memory
 - Hybrid retrieval (text + semantic)
 - Tool calling (custom command memory and Google Calendar tools)
+- Automated RSS monitoring with article summaries
 
 ## 1. Prerequisites
 
@@ -72,6 +73,7 @@ Recommended:
 ```dotenv
 DISCORD_CHANNEL_ID="optional_channel_id_for_startup_message"
 USER_ID="optional_user_id_for_startup_greeting_context"
+NEWS_FEED_URL="http://feeds.bbci.co.uk/news/rss.xml"
 
 # Optional allowlist (bot accepts all users if unset)
 user1="your_discord_username_or_id"
@@ -98,8 +100,24 @@ EXTRA_INSTRUCTIONS=""
 Notes:
 - `TEST_KEY2` is what `src/config.py` currently reads as the Gemini key.
 - If you prefer a different name like `GOOGLE_API_KEY`, update `src/config.py` accordingly.
+- `DISCORD_CHANNEL_ID` is required for RSS posting.
+- `NEWS_FEED_URL` defaults to BBC RSS if not set.
 
-## 5. Optional: Google Calendar tools setup
+## 5. RSS feed summarization
+
+The bot includes a background RSS monitor that runs every 30 minutes.
+
+Behavior:
+- Reads the configured RSS feed.
+- Stores seen article IDs in PostgreSQL table `seen_articles` to avoid reposting duplicates.
+- Fetches article page content from each new entry.
+- Uses Gemini to summarize the article into concise bullet points.
+- Posts title, link, and summary to the configured Discord channel.
+
+Database note:
+- `seen_articles` is created automatically at runtime if it does not exist.
+
+## 6. Optional: Google Calendar tools setup
 
 Calendar tools live in `src/tools/calendar_tools.py`.
 
@@ -118,7 +136,7 @@ src/tools/client_secrets.json
 src/tools/token.json
 ```
 
-## 6. Run the bot
+## 7. Run the bot
 
 From project root with venv active:
 
@@ -128,16 +146,18 @@ python main.py
 
 If successful, you should see a login message in the console.
 
-## 7. Project structure (high level)
+## 8. Project structure (high level)
 
 - `main.py`: Discord bot runtime and message handling
 - `src/agent.py`: LLM orchestration, retrieval, and tool execution loop
+- `src/rss.py`: RSS polling loop and Discord posting
 - `src/conversation_store.py`: PostgreSQL storage, schema setup, hybrid search
 - `src/tools/commands.py`: command registration/lookup tools
+- `src/tools/news_feed_tools.py`: feed parsing, dedupe, and article text extraction
 - `src/tools/calendar_tools.py`: Google Calendar tools
-- `src/prompts.py`: system prompt and formatting instructions
+- `src/utils/prompts.py`: system prompt and formatting instructions
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 ### `ModuleNotFoundError` for local packages
 Run from project root and use:
@@ -168,7 +188,17 @@ Then correct `DATABASE_URL` in `.env`.
 ### Discord rate-limit or quota errors
 If you see `RESOURCE_EXHAUSTED` / `429`, wait and retry after a short period.
 
-## 9. Development notes
+### RSS monitor not starting
+Check these values in `.env`:
+- `DATABASE_URL`
+- `DISCORD_CHANNEL_ID`
+
+If either is missing, RSS startup is skipped and a message is logged.
+
+### RSS posts show no summary
+Some sites block scraping or return unreadable HTML. In those cases, the bot falls back to feed-level content when available.
+
+## 10. Development notes
 
 - Command memory resolution is session-aware.
 - Tool calling supports multiple tools in one conversation turn.
