@@ -145,22 +145,28 @@ async def summarize_news_article(article: dict) -> str:
     source_text = content or feed_summary
     source_text = source_text[:9000]
 
-    system_text = (
-        "You are Angela chatting directly with the user in Discord about a news article. "
-        "Sound conversational, natural, and personable instead of formal or objective. "
+    rss_instructions = (
+        "RSS ARTICLE TASK: Summarize the supplied article for the user in a concise, "
+        "conversational way. Use only the supplied article content and do not invent "
+        "facts or claim to have used external tools. Keep the summary to about 4-6 "
+        "sentences, mention the key point and one or two notable details, and explain "
+        "why it may matter to the user. Do not use JSON or code blocks."
     )
     prompt_text = (
         "Give me a short chat-style summary of this article as if we are talking one-on-one. "
         "Keep it to about 4-6 sentences. "
-        "Mention the key point, one or two notable details, and why it matters to me. "
-        "Do not use JSON or code blocks.\n\n"
+        "Mention the key point and one or two notable details."
+        "Do not use JSON or code blocks, and talk in first person, do not use third person.\n\n"
         f"Title: {title}\n"
-        f"URL: {link}\n\n"
+        #f"URL: {link}\n\n"
         f"Article text:\n{source_text}"
     )
 
     try:
-        messages = [SystemMessage(content=system_text), HumanMessage(content=prompt_text)]
+        messages = [
+            SystemMessage(content=f"{agent.system_prompt}\n\n{rss_instructions}"),
+            HumanMessage(content=prompt_text),
+        ]
         if hasattr(agent.llm, "ainvoke"):
             response = await agent.llm.ainvoke(messages)
         else:

@@ -12,10 +12,12 @@ class ConversationStore:
         embedding_dim: int,
         local_embedding_model: str,
         hybrid_exclude_recent_count: int,
+        rag_half_life_days: float = 30.0,
     ):
         self.embedding_dim = embedding_dim
         self.local_embedding_model = local_embedding_model
         self.hybrid_exclude_recent_count = hybrid_exclude_recent_count
+        self.rag_half_life_days = max(1.0, float(rag_half_life_days))
         self.db_connection = psycopg2.connect(database_url)
 
         self._enable_pgvector()
@@ -149,6 +151,8 @@ class ConversationStore:
         """Combine PostgreSQL full-text search and vector similarity for retrieval."""
         embedding = await embedding_provider(query)
         vector_literal = "[" + ",".join(str(float(x)) for x in embedding) + "]"
+        candidate_limit = max(limit, limit * 4)
+        self.db_connection.rollback()
 
         with self.db_connection.cursor() as cursor:
             cursor.execute(
@@ -166,6 +170,7 @@ class ConversationStore:
                 exact_candidates AS (
                     SELECT
                         id,
+                        created_at,
                         user_message,
                         agent_response,
                         1.25::float AS text_rank,
@@ -183,6 +188,7 @@ class ConversationStore:
                 text_candidates AS (
                     SELECT
                         id,
+                        created_at,
                         user_message,
                         agent_response,
                         ts_rank_cd(search_vector, ts_query.query) AS text_rank,
@@ -197,6 +203,7 @@ class ConversationStore:
                 semantic_candidates AS (
                     SELECT
                         id,
+                        created_at,
                         user_message,
                         agent_response,
                         0::float AS text_rank,
@@ -218,6 +225,7 @@ class ConversationStore:
                 deduped AS (
                     SELECT
                         id,
+                        max(created_at) AS created_at,
                         max(user_message) AS user_message,
                         max(agent_response) AS agent_response,
                         max(text_rank) AS text_rank,
@@ -229,6 +237,7 @@ class ConversationStore:
                     SELECT
                         user_message,
                         agent_response,
+                        created_at,
                         text_rank,
                         semantic_score,
                         CASE
@@ -244,15 +253,37 @@ class ConversationStore:
                                 / NULLIF(max(semantic_score) OVER () - min(semantic_score) OVER (), 0)
                         END AS normalized_semantic_score
                     FROM deduped
-                )
+                ),
+                scored AS (
+                    SELECT
+                    user_message,
+                    agent_response,
+                    text_rank,
+                    semantic_score,
+                    (0.35 * normalized_text_rank) + (0.65 * normalized_semantic_score) AS hybrid_score,
+                    EXP(
+                        -LN(2) * EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))
+                        / (86400.0 * %s)
+                    ) AS decay_factor
+                    FROM normalized
+                ),
+            decayed AS (
                 SELECT
                     user_message,
                     agent_response,
                     text_rank,
                     semantic_score,
-                    (0.35 * normalized_text_rank) + (0.65 * normalized_semantic_score) AS hybrid_score
-                FROM normalized
-                ORDER BY hybrid_score DESC
+                    hybrid_score * decay_factor AS decayed_score
+                FROM scored
+            )
+            SELECT
+                user_message,
+                agent_response,
+                text_rank,
+                semantic_score,
+                decayed_score
+            FROM decayed
+                ORDER BY decayed_score DESC
                 LIMIT %s
                 """,
                 (
@@ -262,13 +293,14 @@ class ConversationStore:
                     session_id,
                     query,
                     query,
-                    limit,
+                    candidate_limit,
                     session_id,
-                    limit,
+                    candidate_limit,
                     vector_literal,
                     session_id,
                     vector_literal,
-                    limit,
+                    candidate_limit,
+                    self.rag_half_life_days,
                     limit,
                 ),
             )
@@ -297,6 +329,7 @@ class ConversationStore:
             return history
 
     def save_conversation(self, session_id: str, user_message: str, agent_response: str, embedding):
+        self.db_connection.rollback()
         with self.db_connection.cursor() as cursor:
             cursor.execute(
                 """

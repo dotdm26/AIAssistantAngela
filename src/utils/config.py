@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("TEST_KEY2")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 
 HYBRID_TOP_K = max(1, int(os.getenv("HYBRID_TOP_K", "5")))
@@ -12,6 +12,7 @@ HYBRID_MIN_PROMPT_CHARS = max(1, int(os.getenv("HYBRID_MIN_PROMPT_CHARS", "24"))
 HYBRID_EXCLUDE_RECENT_COUNT = max(0, int(os.getenv("HYBRID_EXCLUDE_RECENT_COUNT", "4")))
 HYBRID_MIN_SCORE = max(0.0, min(1.0, float(os.getenv("HYBRID_MIN_SCORE", "0.25"))))
 HYBRID_MIN_SCORE_MEMORY = max(0.0, min(1.0, float(os.getenv("HYBRID_MIN_SCORE_MEMORY", "0.15"))))
+RAG_HALF_LIFE_DAYS = max(1.0, float(os.getenv("RAG_HALF_LIFE_DAYS", "30")))
 
 MAX_TOOL_ROUNDS = max(1, int(os.getenv("MAX_TOOL_ROUNDS", "3")))
 TOOL_FILTER_MIN_SCORE = max(0.0, min(1.0, float(os.getenv("TOOL_FILTER_MIN_SCORE", "0.28"))))
@@ -22,6 +23,7 @@ config_values = {
     "HYBRID_EXCLUDE_RECENT_COUNT": HYBRID_EXCLUDE_RECENT_COUNT,
     "HYBRID_MIN_SCORE": HYBRID_MIN_SCORE,
     "HYBRID_MIN_SCORE_MEMORY": HYBRID_MIN_SCORE_MEMORY,
+    "RAG_HALF_LIFE_DAYS": RAG_HALF_LIFE_DAYS,
     "MAX_TOOL_ROUNDS": MAX_TOOL_ROUNDS,
     "TOOL_FILTER_MIN_SCORE": TOOL_FILTER_MIN_SCORE,
 }

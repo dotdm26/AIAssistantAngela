@@ -45,7 +45,7 @@ class RSSMonitor(commands.Cog):
                     print(f"RSSMonitor: summary generation failed: {error}")
 
             summary_block = f"\n\n**Summary:**\n{summary_text}" if summary_text else ""
-            payload = f"📰 **New Article:** {item['title']}\n{item['link']}{summary_block}"
+            payload = f"📰 **New Article:** {item['title']}\n{summary_block}"
             await channel.send(_trim_for_discord(payload))
 
     @rss_ticker.before_loop
