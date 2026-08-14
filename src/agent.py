@@ -9,10 +9,6 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from sentence_transformers import SentenceTransformer, util
 from src.utils.config import (
-    COMMAND_MEMORY_MAX_PROMPT_LEN,
-    COMMAND_SEMANTIC_MAX_WORDS,
-    COMMAND_SEMANTIC_MIN_MARGIN,
-    COMMAND_SEMANTIC_MIN_SCORE,
     GOOGLE_API_KEY,
     LOCAL_EMBEDDING_MODEL,
     HYBRID_TOP_K,
@@ -20,6 +16,7 @@ from src.utils.config import (
     HYBRID_EXCLUDE_RECENT_COUNT,
     HYBRID_MIN_SCORE,
     HYBRID_MIN_SCORE_MEMORY,
+    RAG_HALF_LIFE_DAYS,
     MAX_TOOL_ROUNDS,
     TOOL_FILTER_MIN_SCORE,
 )
@@ -43,12 +40,6 @@ from src.utils.trackers import (
 )
 from src.tools.general_tools import general_tools_list
 from src.tools.web_search_tools import web_search_tools
-from src.tools.commands import (
-    commands_list,
-    detect_command_registration,
-    detect_command_lookup,
-    is_command_candidate,
-)
 from src.tools.calendar_tools import calendar_tools_list
 from src.tools.gmail_tools import (
     gmail_label_tools_list,
@@ -85,19 +76,22 @@ WEB_SEARCH_INTENT_RE = re.compile(
 WEB_DEEPEN_INTENT_RE = re.compile(
     r"\b(continue|further|deeper|deep|more|latest|current|up to date|update|updated|refresh)\b"
 )
+REALTIME_WEB_INTENT_RE = re.compile(
+    r"\b(latest|current|today|recent|right now|at the moment|this week|this month|"
+    r"live|real[- ]?time|up[- ]to[- ]date|breaking|newest)\b"
+)
+TIME_DATE_INTENT_RE = re.compile(r"\b(time|date|day)\b")
 DOMAIN_PATTERN_RE = re.compile(r"\b(?:https?://)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:/[^\s]*)?\b")
 
 general_tool_names = {tool.name: tool for tool in general_tools_list}
-commands_tool_names = {tool.name: tool for tool in commands_list}
 calendar_tool_names = {tool.name: tool for tool in calendar_tools_list}
 gmail_tools_list = gmail_read_tools_list + gmail_label_tools_list + gmail_write_tools_list
 gmail_tool_names = {tool.name: tool for tool in gmail_tools_list}
 web_search_tool_names = {tool.name: tool for tool in web_search_tools}
 
-tools_list = general_tools_list + commands_list + calendar_tools_list + gmail_tools_list + web_search_tools
+tools_list = general_tools_list + calendar_tools_list + gmail_tools_list + web_search_tools
 
 READ_ONLY_TOOL_NAMES = {
-    "use_command",
     "get_time",
     "list_calendars",
     "get_upcoming_calendar_events",
@@ -133,25 +127,6 @@ def _extract_text(content):
     return str(content).strip()
 
 
-def _is_command_candidate(text: str) -> bool:
-    return is_command_candidate(text, max_len=COMMAND_MEMORY_MAX_PROMPT_LEN)
-
-
-def _is_semantic_command_candidate(text: str) -> bool:
-    normalized = (text or "").strip()
-    if not normalized:
-        return False
-
-    word_count = len(normalized.split())
-    if word_count > COMMAND_SEMANTIC_MAX_WORDS:
-        return False
-
-    if normalized.endswith("?"):
-        return False
-
-    return True
-
-
 def _looks_like_memory_key(text: str) -> bool:
     stripped = (text or "").strip().lower()
     if not stripped or len(stripped) > 64:
@@ -161,6 +136,30 @@ def _looks_like_memory_key(text: str) -> bool:
 
 def _is_explicit_memory_intent(text: str) -> bool:
     return bool(MEMORY_INTENT_RE.search((text or "").strip().lower()))
+
+
+def _is_live_tool_request(text: str) -> bool:
+    normalized_text = (text or "").strip().lower()
+    return bool(
+        GMAIL_INTENT_RE.search(normalized_text)
+        or CALENDAR_INTENT_RE.search(normalized_text)
+        or WEB_SEARCH_INTENT_RE.search(normalized_text)
+        or TIME_DATE_INTENT_RE.search(normalized_text)
+    )
+
+
+def _is_mandatory_web_request(text: str) -> bool:
+    normalized_text = (text or "").strip().lower()
+    if _is_explicit_memory_intent(normalized_text):
+        return False
+    if GMAIL_INTENT_RE.search(normalized_text) or CALENDAR_INTENT_RE.search(normalized_text):
+        return False
+    if TIME_DATE_INTENT_RE.search(normalized_text) and not WEB_SEARCH_INTENT_RE.search(normalized_text):
+        return False
+    return bool(
+        WEB_SEARCH_INTENT_RE.search(normalized_text)
+        or REALTIME_WEB_INTENT_RE.search(normalized_text)
+    )
 
 
 def _hybrid_score_threshold(text: str) -> float:
@@ -200,7 +199,6 @@ class AIAgent:
         
         self.llm = ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model="gemini-3.1-flash-lite")
         self.llm_general = self.llm.bind_tools(general_tools_list)
-        self.llm_commands = self.llm.bind_tools(commands_list)
         self.llm_calendar = self.llm.bind_tools(calendar_tools_list)
         self.llm_gmail_read = self.llm.bind_tools(gmail_read_tools_list)
         self.llm_gmail_label = self.llm.bind_tools(gmail_label_tools_list)
@@ -211,20 +209,20 @@ class AIAgent:
         self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
         self.embedding_dim = detect_embedding_dimension(self.embeddings)
         self.conversation_history = {}
-        self.tools_by_name = {**general_tool_names, **commands_tool_names, **calendar_tool_names, **gmail_tool_names, **web_search_tool_names}
+        self.tools_by_name = {**general_tool_names, **calendar_tool_names, **gmail_tool_names, **web_search_tool_names}
 
         self.store = ConversationStore(
             database_url=os.getenv("DATABASE_URL"),
             embedding_dim=self.embedding_dim,
             local_embedding_model=LOCAL_EMBEDDING_MODEL,
             hybrid_exclude_recent_count=HYBRID_EXCLUDE_RECENT_COUNT,
-            command_memory_max_prompt_len=COMMAND_MEMORY_MAX_PROMPT_LEN,
+            rag_half_life_days=RAG_HALF_LIFE_DAYS,
         )
 
         # Agent configuration
         self.system_prompt = build_system_prompt(os.getenv("EXTRA_INSTRUCTIONS"))
 
-    def _get_llm_with_tools_for_prompt(self, prompt: str):
+    def _get_llm_with_tools_for_prompt(self, prompt: str, prompt_embedding=None):
         """Choose a domain-specific tool-bound LLM to keep tool lists small and fast."""
         prompt_text = _extract_text(prompt).strip().lower()
 
@@ -243,11 +241,15 @@ class AIAgent:
         if WEB_SEARCH_INTENT_RE.search(prompt_text):
             return self.llm_web_search
 
+        if TIME_DATE_INTENT_RE.search(prompt_text):
+            return self.llm_general
+
         return self.tool_filter.get_bound_llm_for_prompt(
             prompt,
             llm=self.llm,
             bound_tools_cache=self._bound_tools_cache,
             max_rounds=MAX_TOOL_ROUNDS,
+            prompt_embedding=prompt_embedding,
         )
 
     def should_enable_tools(self, prompt: str) -> bool:
@@ -262,88 +264,6 @@ class AIAgent:
         """Retrieve conversation history for context."""
         return self.store.get_conversation_history(session_id, limit=limit)
 
-    async def _handle_direct_command_intent(self, prompt: str, prompt_text: str, session_id: Optional[str]) -> Optional[str]:
-        if not session_id:
-            return None
-
-        registration = detect_command_registration(prompt)
-        if registration:
-            command_key, command_response = registration
-            await asyncio.to_thread(
-                self.store.record_command_memory,
-                session_id,
-                command_key,
-                command_response,
-            )
-            return f"Registered command '{command_key}'."
-
-        lookup_key = detect_command_lookup(prompt)
-        if lookup_key:
-            command_key = lookup_key
-            command_response = self.store.resolve_command_memory(
-                session_id,
-                command_key,
-            )
-            if command_response:
-                print(
-                    f"[command_memory] resolved exact command | prompt={command_key!r}"
-                )
-                return command_response
-
-            stripped_prompt = prompt.strip()
-            if stripped_prompt.startswith("/") or " " in stripped_prompt:
-                return f"I could not find a registered command for '{lookup_key}'."
-
-        semantic_command_response = await self._resolve_semantic_command_intent(
-            prompt,
-            prompt_text,
-            session_id,
-        )
-        if semantic_command_response is not None:
-            return semantic_command_response
-
-        return None
-
-    async def _resolve_semantic_command_intent(
-        self,
-        prompt: str,
-        prompt_text: str,
-        session_id: Optional[str],
-    ) -> Optional[str]:
-        if not session_id or not _is_semantic_command_candidate(prompt):
-            return None
-
-        if detect_command_registration(prompt) or detect_command_lookup(prompt):
-            return None
-
-        registered_commands = await asyncio.to_thread(self.store.list_registered_commands, session_id)
-        if not registered_commands:
-            return None
-
-        triggers = [row[1] or row[0] for row in registered_commands]
-        if not triggers:
-            return None
-
-        prompt_embedding = self.tool_filter.llm.encode(prompt_text, convert_to_tensor=True)
-        trigger_embeddings = self.tool_filter.llm.encode(triggers, convert_to_tensor=True)
-        cosine_scores = util.cos_sim(prompt_embedding, trigger_embeddings)[0]
-        top_matches = cosine_scores.topk(min(2, len(triggers)))
-        best_index = int(top_matches.indices[0])
-        best_score = float(top_matches.values[0])
-        second_score = float(top_matches.values[1]) if len(triggers) > 1 else 0.0
-        score_margin = best_score - second_score
-
-        if best_score < COMMAND_SEMANTIC_MIN_SCORE or score_margin < COMMAND_SEMANTIC_MIN_MARGIN:
-            return None
-
-        trigger_text, normalized_trigger, response_text = registered_commands[best_index]
-        print(
-            "[command_memory] resolved semantic command "
-            f"| prompt={prompt_text!r} | trigger={normalized_trigger!r} "
-            f"| score={best_score:.3f} | margin={score_margin:.3f}"
-        )
-        return response_text
-
     async def _check_retrieval_context(
         self,
         messages: List[Union[HumanMessage, AIMessage, SystemMessage]],
@@ -354,14 +274,12 @@ class AIAgent:
         if not session_id:
             return ""
 
-        is_session_memory_alias = bool(
-            _is_command_candidate(prompt_text)
-            and self.store.has_exact_user_message(session_id, prompt_text, min_count=2)
-        )
+        if _is_live_tool_request(prompt_text) and not _is_explicit_memory_intent(prompt_text):
+            return ""
+
         should_use_hybrid_search = (
             len(prompt_text) >= HYBRID_MIN_PROMPT_CHARS
             or _looks_like_memory_key(prompt_text)
-            or is_session_memory_alias
             or _is_explicit_memory_intent(prompt_text)
         )
         if not should_use_hybrid_search:
@@ -370,7 +288,7 @@ class AIAgent:
         retrieval_context = ""
         try:
             retrieval_limit = HYBRID_TOP_K
-            if _looks_like_memory_key(prompt_text) or is_session_memory_alias:
+            if _looks_like_memory_key(prompt_text):
                 retrieval_limit = max(HYBRID_TOP_K, 10)
 
             related_conversations = await self.store.hybrid_search_conversations(
@@ -382,8 +300,6 @@ class AIAgent:
 
             top_hybrid_score = max((row[4] for row in related_conversations), default=0.0)
             threshold = _hybrid_score_threshold(prompt_text)
-            if is_session_memory_alias:
-                threshold = min(threshold, HYBRID_MIN_SCORE_MEMORY)
 
             if top_hybrid_score >= threshold:
                 retrieval_context = _format_hybrid_context(related_conversations)
@@ -401,13 +317,14 @@ class AIAgent:
         session_id: Optional[str],
         prompt: str,
         enable_tools: bool = True,
+        tool_prompt_embedding=None,
     ):
         if not enable_tools:
             if hasattr(self.llm, "ainvoke"):
                 return await self.llm.ainvoke(sanitized_messages)
             return await asyncio.to_thread(self.llm.invoke, sanitized_messages)
 
-        llm_with_tools = self._get_llm_with_tools_for_prompt(prompt)
+        llm_with_tools = self._get_llm_with_tools_for_prompt(prompt, tool_prompt_embedding)
         prompt_text = _extract_text(prompt).strip().lower()
         is_web_prompt = bool(WEB_SEARCH_INTENT_RE.search(prompt_text))
         is_web_deepen_prompt = bool(is_web_prompt and WEB_DEEPEN_INTENT_RE.search(prompt_text))
@@ -461,6 +378,20 @@ class AIAgent:
 
                 tool_messages = await asyncio.gather(*[_invoke_one(tool_call) for tool_call in tool_calls])
                 conversation_for_model.extend(tool_messages)
+                time_messages = [
+                    tool_message.content
+                    for tool_call, tool_message in zip(tool_calls, tool_messages)
+                    if tool_call.get("name") == "get_time"
+                ]
+                if time_messages:
+                    conversation_for_model.append(
+                        SystemMessage(
+                            content=f"The authoritative get_time result is: {time_messages[0]}\n"
+                            "Use that exact date, time, and timezone in your response. "
+                            "Do not calculate, reinterpret, or replace it. You may retain "
+                            "Angela's personality and Discord formatting."
+                        )
+                    )
                 continue
 
             for tool_call in tool_calls:
@@ -492,6 +423,15 @@ class AIAgent:
                         tool_call_id=tool_id,
                     )
                 )
+                if tool_name == "get_time":
+                    conversation_for_model.append(
+                        SystemMessage(
+                            content=f"The authoritative get_time result is: {tool_output}\n"
+                            "Use that exact date, time, and timezone in your response. "
+                            "Do not calculate, reinterpret, or replace it. You may retain "
+                            "Angela's personality and Discord formatting."
+                        )
+                    )
 
         # Hard fallback for explicit web prompts when model skips tool calls.
         # This guarantees at least one live web lookup before responding.
@@ -548,6 +488,48 @@ class AIAgent:
 
         return response
 
+    async def _invoke_mandatory_web_search(
+        self,
+        sanitized_messages: List[Union[HumanMessage, AIMessage, SystemMessage]],
+        prompt: str,
+    ):
+        prompt_text = _extract_text(prompt).strip().lower()
+        search_tool = self.tools_by_name.get("search_web")
+        if search_tool is None:
+            search_result = "Web search is unavailable."
+        else:
+            search_args = {
+                "query": prompt,
+                "search_depth": "advanced" if REALTIME_WEB_INTENT_RE.search(prompt_text) else "basic",
+                "include_answer": True,
+            }
+            domains = _extract_domains_from_text(prompt_text)
+            if domains:
+                search_args["include_domains"] = domains
+
+            try:
+                search_result = await asyncio.to_thread(search_tool.invoke, search_args)
+            except Exception as exc:
+                search_result = f"Live web search failed: {exc}"
+
+        grounded_messages = list(sanitized_messages)
+        grounded_messages.append(
+            SystemMessage(
+                content=(
+                    "LIVE WEB REQUEST: The supplied search result is the source of truth for this answer. "
+                    "Do not answer from training data when the result is missing or unclear. "
+                    "State plainly when the live result is insufficient."
+                )
+            )
+        )
+        grounded_messages.append(
+            HumanMessage(content=f"Live web search result for the user's request:\n{search_result}")
+        )
+
+        if hasattr(self.llm, "ainvoke"):
+            return await self.llm.ainvoke(grounded_messages)
+        return await asyncio.to_thread(self.llm.invoke, grounded_messages)
+
     async def generate_reply(
         self,
         history: List[Union[HumanMessage, AIMessage, SystemMessage]],
@@ -559,10 +541,6 @@ class AIAgent:
 
         messages = list(history)
         prompt_text = _extract_text(prompt).lower()
-
-        direct_command_response = await self._handle_direct_command_intent(prompt, prompt_text, session_id)
-        if direct_command_response is not None:
-            return direct_command_response
 
         retrieval_context = await self._check_retrieval_context(messages, prompt, prompt_text, session_id)
 
@@ -577,12 +555,28 @@ class AIAgent:
         estimated_input_tokens = estimate_token_count(sanitized_messages, _extract_text)
         log_token_estimate_input(estimated_input_tokens, len(sanitized_messages), bool(retrieval_context))
 
-        enable_tools = self.tool_filter.should_invoke_with_tools(prompt, min_score=TOOL_FILTER_MIN_SCORE)
+        if _is_mandatory_web_request(prompt_text):
+            response = await self._invoke_mandatory_web_search(sanitized_messages, prompt)
+            log_token_usage(response)
+            output = _extract_text(getattr(response, "content", response))
+            log_token_estimate_output(output)
+            return output
+
+        tool_prompt_embedding = None
+        if not _is_live_tool_request(prompt_text) and self.tool_filter.has_tool_intent(prompt):
+            tool_prompt_embedding = self.tool_filter.embed_prompt(prompt)
+
+        enable_tools = self.tool_filter.should_invoke_with_tools(
+            prompt,
+            min_score=TOOL_FILTER_MIN_SCORE,
+            prompt_embedding=tool_prompt_embedding,
+        )
         response = await self._invoke_model(
             sanitized_messages,
             session_id,
             prompt,
             enable_tools=enable_tools,
+            tool_prompt_embedding=tool_prompt_embedding,
         )
 
         log_token_usage(response)
@@ -605,7 +599,10 @@ class AIAgent:
     async def store_conversation(self, session_id: str, user_message: str, agent_response: str):
         """Store a conversation in the database, including its embedding for semantic search."""
         combined_text = f"{user_message}\n\n{agent_response}"
-        embedding = await self.generate_embedding(combined_text)
+        if hasattr(self.embeddings, "embed_document"):
+            embedding = await asyncio.to_thread(self.embeddings.embed_document, combined_text)
+        else:
+            embedding = await self.generate_embedding(combined_text)
         await asyncio.to_thread(
             self.store.save_conversation,
             session_id,
@@ -633,26 +630,28 @@ class ToolFilter:
         if not text:
             return False
 
-        if detect_command_registration(text) or detect_command_lookup(text):
-            return True
-
         return bool(TOOL_INTENT_RE.search(text))
 
-    def should_invoke_with_tools(self, prompt: str, min_score: float) -> bool:
+    def embed_prompt(self, prompt: str):
+        return self.llm.encode(prompt, convert_to_tensor=True)
+
+    def should_invoke_with_tools(self, prompt: str, min_score: float, prompt_embedding=None) -> bool:
         """Route to tool-bound model only when intent and relevance both indicate tool use."""
         text = _extract_text(prompt).strip().lower()
 
-        if detect_command_registration(text) or detect_command_lookup(text):
-            return True
-
-        if WEB_SEARCH_INTENT_RE.search(text) or GMAIL_INTENT_RE.search(text) or CALENDAR_INTENT_RE.search(text):
+        if (
+            WEB_SEARCH_INTENT_RE.search(text)
+            or GMAIL_INTENT_RE.search(text)
+            or CALENDAR_INTENT_RE.search(text)
+            or TIME_DATE_INTENT_RE.search(text)
+        ):
             return True
 
         if not self.has_tool_intent(prompt):
             return False
 
         try:
-            top_score = self.get_top_score(prompt)
+            top_score = self.get_top_score(prompt, prompt_embedding=prompt_embedding)
             decision = top_score >= min_score
             log_tool_router_decision(top_score, min_score, decision)
             return decision
@@ -661,7 +660,14 @@ class ToolFilter:
             log_tool_router_fallback(exc)
             return True
 
-    def get_bound_llm_for_prompt(self, prompt: str, llm, bound_tools_cache: dict, max_rounds: int = MAX_TOOL_ROUNDS):
+    def get_bound_llm_for_prompt(
+        self,
+        prompt: str,
+        llm,
+        bound_tools_cache: dict,
+        max_rounds: int = MAX_TOOL_ROUNDS,
+        prompt_embedding=None,
+    ):
         """Bind only top relevant tools for this prompt, with safe fallbacks and cache."""
         selected_tools = self.tool_library
         selected_tool_names = [tool.name for tool in self.tool_library]
@@ -672,7 +678,11 @@ class ToolFilter:
         force_web_tools = bool(WEB_SEARCH_INTENT_RE.search(prompt_text))
 
         try:
-            filtered_tools = self.get_relevant_tools(prompt, max_rounds=max_rounds)
+            filtered_tools = self.get_relevant_tools(
+                prompt,
+                max_rounds=max_rounds,
+                prompt_embedding=prompt_embedding,
+            )
             if filtered_tools:
                 selected_tools = filtered_tools
                 selected_tool_names = [tool.name for tool in filtered_tools]
@@ -707,20 +717,22 @@ class ToolFilter:
         log_tool_filter_selected(selected_tool_names)
         return bound_tools_cache[cache_key]
 
-    def get_relevant_tools(self, prompt, max_rounds: int = MAX_TOOL_ROUNDS):
+    def get_relevant_tools(self, prompt, max_rounds: int = MAX_TOOL_ROUNDS, prompt_embedding=None):
         """Filter tools based on the prompt."""
-        prompt_embedding = self.llm.encode(prompt, convert_to_tensor=True)
+        if prompt_embedding is None:
+            prompt_embedding = self.embed_prompt(prompt)
         cosine_scores = util.cos_sim(prompt_embedding, self.tool_embeddings)[0]
         k = max(1, min(max_rounds, len(self.tool_library)))
         top_tools = cosine_scores.topk(k)
         return [self.tool_library[i] for i in top_tools.indices]
 
-    def get_top_score(self, prompt) -> float:
+    def get_top_score(self, prompt, prompt_embedding=None) -> float:
         """Return top cosine similarity between prompt and tool descriptions."""
         if not self.tool_library:
             return 0.0
 
-        prompt_embedding = self.llm.encode(prompt, convert_to_tensor=True)
+        if prompt_embedding is None:
+            prompt_embedding = self.embed_prompt(prompt)
         cosine_scores = util.cos_sim(prompt_embedding, self.tool_embeddings)[0]
         return float(cosine_scores.max().item())
 

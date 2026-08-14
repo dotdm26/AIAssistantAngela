@@ -11,14 +11,19 @@ class LocalNomicEmbeddings:
         self.model_name = model_name
         self.model = SentenceTransformer(model_name, trust_remote_code=True)
 
-    def embed_query(self, text: str) -> List[float]:
-        # Nomic v1.5 expects task prefixing for best retrieval quality.
+    def _encode(self, text: str, prefix: str) -> List[float]:
         encoded = self.model.encode(
-            f"search_document: {text}",
+            f"{prefix}: {text}",
             normalize_embeddings=True,
             convert_to_numpy=True,
         )
         return encoded.tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._encode(text, "search_query")
+
+    def embed_document(self, text: str) -> List[float]:
+        return self._encode(text, "search_document")
 
     async def aembed_query(self, text: str) -> List[float]:
         return await asyncio.to_thread(self.embed_query, text)
