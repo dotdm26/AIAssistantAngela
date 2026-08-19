@@ -3,8 +3,8 @@
 A Discord-based AI assistant that combines:
 - Gemini chat responses via LangChain
 - PostgreSQL conversation memory
-- Hybrid retrieval (text + semantic)
-- Tool calling (custom command memory and Google Calendar tools)
+- Hybrid retrieval (text + semantic) with time decay and embeddings
+- Tool calling (Gmail, Google Calendar, web search)
 - Automated RSS monitoring with article summaries
 
 ## 1. Prerequisites
@@ -12,10 +12,7 @@ A Discord-based AI assistant that combines:
 - Python 3.11+ (3.12 recommended)
 - PostgreSQL 14+ (with `pgvector` extension available)
 - A Discord bot token
-- A Google API key for Gemini
-
-Optional:
-- Google Calendar OAuth client secrets if you want calendar tools
+- A Google API key for Gemini LLM (can substitute with other LLMs e.g. Ollama)
 
 ## 2. Clone and install
 
@@ -95,9 +92,9 @@ EXTRA_INSTRUCTIONS=""
 ```
 
 Notes:
-- `TEST_KEY2` is what `src/config.py` currently reads as the Gemini key.
-- If you prefer a different name like `GOOGLE_API_KEY`, update `src/config.py` accordingly.
-- `DISCORD_CHANNEL_ID` is required for RSS posting.
+- `GOOGLE_API_KEY` is what `src/config.py` currently reads as the Gemini key.
+- If you prefer a different name, update `src/config.py` accordingly.
+- `DISCORD_CHANNEL_ID` is required for set the preferred channel for interacting with the bot.
 - `NEWS_FEED_URL` defaults to BBC RSS if not set.
 
 ## 5. RSS feed summarization
@@ -112,15 +109,15 @@ Behavior:
 - Posts title, link, and summary to the configured Discord channel.
 
 Database note:
-- `seen_articles` is created automatically at runtime if it does not exist.
+- `seen_articles` is created automatically at runtime if the article does not exist.
 
-## 6. Optional: Google Calendar tools setup
+## 6. Google tools setup
 
-Calendar tools live in `src/tools/calendar_tools.py`.
+Google tools live in `src/tools/`, e.g. `calendar_tools.py` and `gmail_tools.py`
 
 To enable them:
 
-1. Create OAuth client credentials in Google Cloud for Calendar API.
+1. Create OAuth client credentials in Google Cloud for required APIs (Gmail & Calendar).
 2. Download the OAuth client JSON and place it at:
 
 ```text

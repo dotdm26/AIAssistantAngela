@@ -8,6 +8,7 @@ from typing import Optional, Union
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from src.agent import AIAgent
 from src.rss import RSSMonitor
+from src.utils.prompts import configure_formatting, rss_article_summary_instructions, rss_article_summary_prompt
 
 load_dotenv()
 
@@ -145,26 +146,14 @@ async def summarize_news_article(article: dict) -> str:
     source_text = content or feed_summary
     source_text = source_text[:9000]
 
-    rss_instructions = (
-        "RSS ARTICLE TASK: Summarize the supplied article for the user in a concise, "
-        "conversational way. Use only the supplied article content and do not invent "
-        "facts or claim to have used external tools. Keep the summary to about 4-6 "
-        "sentences, mention the key point and one or two notable details, and explain "
-        "why it may matter to the user. Do not use JSON or code blocks."
-    )
-    prompt_text = (
-        "Give me a short chat-style summary of this article as if we are talking one-on-one. "
-        "Keep it to about 4-6 sentences. "
-        "Mention the key point and one or two notable details."
-        "Do not use JSON or code blocks, and talk in first person, do not use third person.\n\n"
-        f"Title: {title}\n"
-        #f"URL: {link}\n\n"
-        f"Article text:\n{source_text}"
-    )
+    rss_instructions = rss_article_summary_instructions()
+    prompt_text = rss_article_summary_prompt(title, source_text)
 
     try:
         messages = [
-            SystemMessage(content=f"{agent.system_prompt}\n\n{rss_instructions}"),
+            SystemMessage(
+                content=f"{agent.system_prompt}\n\n{configure_formatting(is_tool_task=True)}\n\n{rss_instructions}"
+            ),
             HumanMessage(content=prompt_text),
         ]
         if hasattr(agent.llm, "ainvoke"):

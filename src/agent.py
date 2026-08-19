@@ -50,7 +50,7 @@ from src.tools.gmail_tools import (
 load_dotenv()
 
 MEMORY_INTENT_RE = re.compile(
-    r"\b(remind|remember|earlier|previous|before|last time|you said|we said|continue|recap|summary|what did i)\b"
+    r"\b(remind|remember|earlier|previous|before|last time|you said|we said|continue|recap|what did i)\b"
 )
 TOOL_INTENT_RE = re.compile(
     r"\b(calendar|event|schedule|meeting|reminder|time|date|gmail|email|mail|inbox|message|messages|label|labels|draft|run|execute|use command|check|search|web|browse|crawl|extract|url|/\w+)\b"
@@ -544,6 +544,20 @@ class AIAgent:
 
         retrieval_context = await self._check_retrieval_context(messages, prompt, prompt_text, session_id)
 
+        is_mandatory_web = _is_mandatory_web_request(prompt_text)
+        tool_prompt_embedding = None
+        if not _is_live_tool_request(prompt_text) and self.tool_filter.has_tool_intent(prompt):
+            tool_prompt_embedding = self.tool_filter.embed_prompt(prompt)
+
+        enable_tools = self.tool_filter.should_invoke_with_tools(
+            prompt,
+            min_score=TOOL_FILTER_MIN_SCORE,
+            prompt_embedding=tool_prompt_embedding,
+        )
+        is_tool_task = is_mandatory_web or _is_live_tool_request(prompt_text) or enable_tools
+
+        # Swap in task-focused (clarity-first) or casual (companion) formatting per turn.
+        messages.append(SystemMessage(content=configure_formatting(is_tool_task)))
         messages.append(HumanMessage(content=prompt))
         sanitized_messages = []
         for message in messages:
@@ -555,22 +569,13 @@ class AIAgent:
         estimated_input_tokens = estimate_token_count(sanitized_messages, _extract_text)
         log_token_estimate_input(estimated_input_tokens, len(sanitized_messages), bool(retrieval_context))
 
-        if _is_mandatory_web_request(prompt_text):
+        if is_mandatory_web:
             response = await self._invoke_mandatory_web_search(sanitized_messages, prompt)
             log_token_usage(response)
             output = _extract_text(getattr(response, "content", response))
             log_token_estimate_output(output)
             return output
 
-        tool_prompt_embedding = None
-        if not _is_live_tool_request(prompt_text) and self.tool_filter.has_tool_intent(prompt):
-            tool_prompt_embedding = self.tool_filter.embed_prompt(prompt)
-
-        enable_tools = self.tool_filter.should_invoke_with_tools(
-            prompt,
-            min_score=TOOL_FILTER_MIN_SCORE,
-            prompt_embedding=tool_prompt_embedding,
-        )
         response = await self._invoke_model(
             sanitized_messages,
             session_id,
