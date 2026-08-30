@@ -64,6 +64,12 @@ class ConversationStore:
                 ON conversations USING GIN (search_vector)
                 """
             )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS conversations_session_created_idx
+                ON conversations (session_id, created_at DESC)
+                """
+            )
             self.db_connection.commit()
 
     def _get_embedding_column_info(self, cursor) -> Optional[str]:
