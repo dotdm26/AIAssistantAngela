@@ -86,11 +86,11 @@ def schedule_store_conversation(user_key: str, user_message: str, agent_response
     task = asyncio.create_task(agent.store_conversation(user_key, user_message, agent_response))
     task.add_done_callback(_log_store_conversation_error)
 
-def prepare_history(
+async def prepare_history(
     user_key: str,
     limit: Optional[int] = HISTORY_LIMIT,
 ) -> list[Union[HumanMessage, AIMessage, SystemMessage]]:
-    history = agent.get_conversation_history(user_key, limit=limit)
+    history = await agent.get_conversation_history(user_key, limit=limit)
     if not history:
         return [SystemMessage(content=agent.system_prompt)]
 
@@ -98,7 +98,7 @@ def prepare_history(
     return history
 
 async def send_startup_greeting(channel, user_key: str):
-    history = prepare_history(user_key)
+    history = await prepare_history(user_key)
     agent.conversation_history[user_key] = history
 
     new_session_prompt = (
@@ -120,7 +120,7 @@ async def handle_user_message(message):
         return
 
     user_key = str(message.author.id)
-    history = prepare_history(user_key)
+    history = await prepare_history(user_key)
     agent.conversation_history[user_key] = history
 
     reply_text = await agent.generate_reply(history, prompt, session_id=user_key)

@@ -1,7 +1,10 @@
+import asyncio
 import re
+from contextlib import contextmanager
 from typing import Awaitable, Callable, List, Optional
 
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
 from langchain_core.messages import AIMessage, HumanMessage
 
 
@@ -18,27 +21,39 @@ class ConversationStore:
         self.local_embedding_model = local_embedding_model
         self.hybrid_exclude_recent_count = hybrid_exclude_recent_count
         self.rag_half_life_days = max(1.0, float(rag_half_life_days))
-        self.db_connection = psycopg2.connect(database_url)
+        self.db_pool = ThreadedConnectionPool(minconn=1, maxconn=5, dsn=database_url)
 
-        self._enable_pgvector()
-        self.create_tables()
-        self._ensure_embedding_column()
-        self._ensure_text_search_column()
+        with self._connection() as connection:
+            self._enable_pgvector(connection)
+            self.create_tables(connection)
+            self._ensure_embedding_column(connection)
+            self._ensure_text_search_column(connection)
+
+    @contextmanager
+    def _connection(self):
+        connection = self.db_pool.getconn()
+        try:
+            yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            self.db_pool.putconn(connection)
 
     # MANUALLY CREATE THE EXTENSION AS SUPERUSER IN POSTGRESQL BEFORE RUNNING THE BOT,
     # OTHERWISE EMBEDDINGS WILL BE STORED AS JSON.
-    def _enable_pgvector(self):
+    def _enable_pgvector(self, connection):
         """Enable pgvector extension if not already enabled."""
         try:
-            with self.db_connection.cursor() as cursor:
+            with connection.cursor() as cursor:
                 cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-                self.db_connection.commit()
+                connection.commit()
         except Exception as e:
             print(f"Note: pgvector extension not available: {e}. Embeddings will be stored as JSON.")
 
-    def create_tables(self):
+    def create_tables(self, connection):
         """Ensure required tables exist."""
-        with self.db_connection.cursor() as cursor:
+        with connection.cursor() as cursor:
             cursor.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS conversations (
@@ -70,7 +85,7 @@ class ConversationStore:
                 ON conversations (session_id, created_at DESC)
                 """
             )
-            self.db_connection.commit()
+            connection.commit()
 
     def _get_embedding_column_info(self, cursor) -> Optional[str]:
         cursor.execute(
@@ -88,13 +103,13 @@ class ConversationStore:
         row = cursor.fetchone()
         return row[0] if row else None
 
-    def _ensure_embedding_column(self):
+    def _ensure_embedding_column(self, connection):
         """Verify the conversations.embedding column matches the active model's dimension."""
-        with self.db_connection.cursor() as cursor:
+        with connection.cursor() as cursor:
             column_info = self._get_embedding_column_info(cursor)
             if not column_info:
                 cursor.execute(f"ALTER TABLE conversations ADD COLUMN embedding vector({self.embedding_dim});")
-                self.db_connection.commit()
+                connection.commit()
                 return
 
             match = re.search(r"vector\((\d+)\)", column_info)
@@ -115,9 +130,9 @@ class ConversationStore:
                 "dimension. New inserts will fail until this is resolved."
             )
 
-    def _ensure_text_search_column(self):
+    def _ensure_text_search_column(self, connection):
         """Ensure the generated tsvector column and GIN index exist for full-text search."""
-        with self.db_connection.cursor() as cursor:
+        with connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT column_name
@@ -145,7 +160,7 @@ class ConversationStore:
                 ON conversations USING GIN (search_vector)
                 """
             )
-            self.db_connection.commit()
+            connection.commit()
 
     async def hybrid_search_conversations(
         self,
@@ -156,11 +171,19 @@ class ConversationStore:
     ):
         """Combine PostgreSQL full-text search and vector similarity for retrieval."""
         embedding = await embedding_provider(query)
+        return await asyncio.to_thread(
+            self._hybrid_search_sync,
+            query,
+            session_id,
+            embedding,
+            limit,
+        )
+
+    def _hybrid_search_sync(self, query: str, session_id: str, embedding, limit: int):
         vector_literal = "[" + ",".join(str(float(x)) for x in embedding) + "]"
         candidate_limit = max(limit, limit * 4)
-        self.db_connection.rollback()
 
-        with self.db_connection.cursor() as cursor:
+        with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 WITH recent_ids AS (
@@ -312,14 +335,17 @@ class ConversationStore:
             )
             return cursor.fetchall()
 
-    def get_conversation_history(self, session_id: str, limit: Optional[int] = None):
+    async def get_conversation_history(self, session_id: str, limit: Optional[int] = None):
         """Retrieve conversation history for context."""
-        with self.db_connection.cursor() as cursor:
+        return await asyncio.to_thread(self._get_conversation_history_sync, session_id, limit)
+
+    def _get_conversation_history_sync(self, session_id: str, limit: Optional[int] = None):
+        with self._connection() as connection, connection.cursor() as cursor:
             query = """
-                SELECT user_message, agent_response
-                FROM conversations
-                WHERE session_id = %s
-                ORDER BY created_at DESC
+            SELECT user_message, agent_response
+            FROM conversations
+            WHERE session_id = %s
+            ORDER BY created_at DESC
             """
             params = [session_id]
             if limit is not None:
@@ -335,16 +361,16 @@ class ConversationStore:
             return history
 
     def save_conversation(self, session_id: str, user_message: str, agent_response: str, embedding):
-        self.db_connection.rollback()
-        with self.db_connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO conversations (session_id, user_message, agent_response, embedding)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (session_id, user_message, agent_response, embedding),
-            )
-            self.db_connection.commit()
+        with self._connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO conversations (session_id, user_message, agent_response, embedding)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (session_id, user_message, agent_response, embedding),
+                )
+                connection.commit()
 
     def close(self):
-        self.db_connection.close()
+        self.db_pool.closeall()

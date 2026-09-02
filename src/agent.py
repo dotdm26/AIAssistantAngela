@@ -256,13 +256,13 @@ class AIAgent:
         """Public helper for callers to detect whether this prompt is likely to trigger tools."""
         return self.tool_filter.has_tool_intent(prompt)
 
-    def get_conversation_history(
+    async def get_conversation_history(
         self,
         session_id: str,
         limit: Optional[int] = None,
     ) -> List[Union[HumanMessage, AIMessage, SystemMessage]]:
         """Retrieve conversation history for context."""
-        return self.store.get_conversation_history(session_id, limit=limit)
+        return await self.store.get_conversation_history(session_id, limit=limit)
 
     async def _check_retrieval_context(
         self,
@@ -542,12 +542,26 @@ class AIAgent:
         messages = list(history)
         prompt_text = _extract_text(prompt).lower()
 
-        retrieval_context = await self._check_retrieval_context(messages, prompt, prompt_text, session_id)
-
         is_mandatory_web = _is_mandatory_web_request(prompt_text)
-        tool_prompt_embedding = None
-        if not _is_live_tool_request(prompt_text) and self.tool_filter.has_tool_intent(prompt):
-            tool_prompt_embedding = self.tool_filter.embed_prompt(prompt)
+        should_embed_for_tools = (
+            not _is_live_tool_request(prompt_text)
+            and self.tool_filter.has_tool_intent(prompt)
+        )
+        retrieval_task = self._check_retrieval_context(
+            messages,
+            prompt,
+            prompt_text,
+            session_id,
+        )
+        embedding_task = (
+            asyncio.to_thread(self.tool_filter.embed_prompt, prompt)
+            if should_embed_for_tools
+            else asyncio.sleep(0, result=None)
+        )
+        retrieval_context, tool_prompt_embedding = await asyncio.gather(
+            retrieval_task,
+            embedding_task,
+        )
 
         enable_tools = self.tool_filter.should_invoke_with_tools(
             prompt,
