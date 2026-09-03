@@ -164,20 +164,46 @@ def _list_messages(user_id: str, query: Optional[str], max_results: int, label_i
         "list_messages",
         lambda: service.users().messages().list(**list_kwargs),
     )
-    messages = response.get("messages", [])
+    message_refs = response.get("messages", [])
+    if not message_refs:
+        return {"count": 0, "messages": []}
 
-    items = []
-    for item in messages:
-        message = _execute_gmail_request(
-            "get_message",
-            lambda item_id=item["id"]: service.users().messages().get(
-                userId=user_id,
-                id=item_id,
-                format="metadata",
-                metadataHeaders=["Subject", "From", "To", "Date"],
+    fetched_messages = {}
+    failures = {}
+
+    def handle_message(message_id, message, exception):
+        if exception is not None:
+            failures[message_id] = exception
+        else:
+            fetched_messages[message_id] = message
+
+    batch = service.new_batch_http_request()
+    for message_ref in message_refs:
+        message_id = message_ref["id"]
+        request = service.users().messages().get(
+            userId=user_id,
+            id=message_id,
+            format="metadata",
+            metadataHeaders=["Subject", "From", "To", "Date"],
+        )
+        batch.add(
+            request,
+            callback=lambda request_id, message, exception, message_id=message_id: handle_message(
+                message_id,
+                message,
+                exception,
             ),
         )
-        items.append(_message_to_dict(message))
+
+    batch.execute()
+
+    for message_id, exception in failures.items():
+        raise exception
+
+    items = [
+        _message_to_dict(fetched_messages[message_ref["id"]])
+        for message_ref in message_refs
+    ]
 
     return {"count": len(items), "messages": items}
 
