@@ -70,8 +70,8 @@ class DiscordAdapter:
         intents = discord.Intents.default()
         intents.message_content = True
         self.client = discord.Client(intents=intents)
-        self.client.event(self._on_ready)
-        self.client.event(self._on_message)
+        self.client.event(self.on_ready)
+        self.client.event(self.on_message)
 
     def _allowed_values(self) -> set[str]:
         return {value for value in self.config.discord.allowed_users if value}
@@ -193,7 +193,7 @@ class DiscordAdapter:
             self.health.update("rss", "failed", str(exc))
             self.logger.exception("Failed to start RSS monitor")
 
-    async def _on_ready(self):
+    async def on_ready(self):
         self.health.update("discord", "ready", f"Connected as {self.client.user}")
         self.logger.info("Connected to Discord as %s", self.client.user)
         await self._ensure_rss_monitor()
@@ -217,7 +217,7 @@ class DiscordAdapter:
         await channel.send("**...**")
         await self._send_startup_greeting(channel, self.config.discord.startup_user_id)
 
-    async def _on_message(self, message):
+    async def on_message(self, message):
         if message.author.bot or not self._is_allowed_user(message.author):
             return
         try:

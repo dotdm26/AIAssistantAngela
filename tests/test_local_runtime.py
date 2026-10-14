@@ -6,7 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.desktop.app import system_tray_supported
-from src.runtime.config import load_config, save_config
+from src.runtime.config import AppConfig, load_config, save_config
+from src.runtime.discord_adapter import DiscordAdapter
 from src.runtime.observability import HealthRegistry, redact
 from src.storage.sqlite_store import SQLiteConversationStore
 
@@ -72,6 +73,16 @@ class LocalRuntimeTests(unittest.TestCase):
     def test_system_tray_can_be_disabled_explicitly(self):
         with patch.dict(os.environ, {"ANGELA_DISABLE_TRAY": "true"}, clear=True):
             self.assertFalse(system_tray_supported())
+
+    def test_discord_adapter_registers_dispatchable_event_names(self):
+        adapter = DiscordAdapter(
+            config=AppConfig(),
+            secrets=object(),
+            agent=object(),
+        )
+
+        self.assertEqual(adapter.client.on_ready, adapter.on_ready)
+        self.assertEqual(adapter.client.on_message, adapter.on_message)
 
 
 if __name__ == "__main__":
