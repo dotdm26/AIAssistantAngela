@@ -25,6 +25,9 @@ from src.utils.config import (
 # os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 from src.conversation_store import ConversationStore
+from src.runtime.config import AppConfig, load_config
+from src.runtime.secrets import SecretStore, get_secret_store
+from src.storage.factory import create_conversation_store
 from src.utils.embeddings import LocalNomicEmbeddings, detect_embedding_dimension
 from src.utils.prompts import build_system_prompt, configure_formatting
 from src.utils.trackers import (
@@ -195,9 +198,18 @@ def _extract_domains_from_text(text: str) -> List[str]:
     return domains
 
 class AIAgent:
-    def __init__(self):
-        
-        self.llm = ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model="gemini-3.1-flash-lite")
+    def __init__(
+        self,
+        config: Optional[AppConfig] = None,
+        secret_store: Optional[SecretStore] = None,
+        conversation_store=None,
+    ):
+        self.runtime_config = config or load_config()
+        self.secret_store = secret_store or get_secret_store()
+        google_api_key = self.secret_store.get("google_api_key") or GOOGLE_API_KEY
+        model_name = self.runtime_config.llm.model
+
+        self.llm = ChatGoogleGenerativeAI(api_key=google_api_key, model=model_name)
         self.llm_general = self.llm.bind_tools(general_tools_list)
         self.llm_calendar = self.llm.bind_tools(calendar_tools_list)
         self.llm_gmail_read = self.llm.bind_tools(gmail_read_tools_list)
@@ -206,21 +218,21 @@ class AIAgent:
         self.llm_web_search = self.llm.bind_tools(web_search_tools)
         self.tool_filter = ToolFilter()
         self._bound_tools_cache = {}
-        self.embeddings = LocalNomicEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
+        embedding_model = self.runtime_config.memory.embedding_model or LOCAL_EMBEDDING_MODEL
+        self.embeddings = LocalNomicEmbeddings(model_name=embedding_model)
         self.embedding_dim = detect_embedding_dimension(self.embeddings)
         self.conversation_history = {}
         self.tools_by_name = {**general_tool_names, **calendar_tool_names, **gmail_tool_names, **web_search_tool_names}
 
-        self.store = ConversationStore(
-            database_url=os.getenv("DATABASE_URL"),
+        self.store = conversation_store or create_conversation_store(
+            self.runtime_config,
             embedding_dim=self.embedding_dim,
-            local_embedding_model=LOCAL_EMBEDDING_MODEL,
-            hybrid_exclude_recent_count=HYBRID_EXCLUDE_RECENT_COUNT,
-            rag_half_life_days=RAG_HALF_LIFE_DAYS,
         )
 
         # Agent configuration
-        self.system_prompt = build_system_prompt(os.getenv("EXTRA_INSTRUCTIONS"))
+        self.system_prompt = build_system_prompt(
+            self.runtime_config.extra_instructions or os.getenv("EXTRA_INSTRUCTIONS")
+        )
 
     def _get_llm_with_tools_for_prompt(self, prompt: str, prompt_embedding=None):
         """Choose a domain-specific tool-bound LLM to keep tool lists small and fast."""

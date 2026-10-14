@@ -21,8 +21,11 @@ httpx>=0.28.0
 # Runtime and utilities
 pydantic>=2.13.0
 pydantic-settings>=2.0.0
+keyring>=25.0.0
+pystray>=0.19.5
+Pillow>=10.0.0
 requests>=2.32.0
 pymongo>=4.10.0
-psycopg2>=2.9.12
+psycopg2-binary>=2.9.12
 sentence-transformers>=5.6.0
 einops>=0.8.2
