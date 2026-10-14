@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import queue
 import subprocess
 import sys
@@ -21,6 +22,19 @@ from src.runtime.config import load_config
 from src.runtime.diagnostics import run_diagnostics
 from src.runtime.secrets import get_secret_store
 from src.desktop.setup_wizard import SetupWizard
+
+
+def system_tray_supported() -> bool:
+    """Return whether starting a desktop tray icon is appropriate."""
+    if os.getenv("ANGELA_DISABLE_TRAY", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
+    if not sys.platform.startswith("linux"):
+        return True
+    return not (
+        os.getenv("WSL_DISTRO_NAME")
+        or os.getenv("WSL_INTEROP")
+        or "microsoft" in platform.release().lower()
+    )
 
 
 class AngelaDesktopApp:
@@ -49,6 +63,8 @@ class AngelaDesktopApp:
 
     def _setup_tray(self):
         """Create a tray icon when the platform supports pystray."""
+        if not system_tray_supported():
+            return
         try:
             import pystray
             from PIL import Image, ImageDraw

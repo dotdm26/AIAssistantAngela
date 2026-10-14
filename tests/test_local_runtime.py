@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from src.desktop.app import system_tray_supported
 from src.runtime.config import load_config, save_config
 from src.runtime.observability import HealthRegistry, redact
 from src.storage.sqlite_store import SQLiteConversationStore
@@ -59,6 +60,18 @@ class LocalRuntimeTests(unittest.TestCase):
         health.update("database", "ready", "sqlite")
         self.assertEqual(health.snapshot()[0]["state"], "ready")
         self.assertNotIn("not-secret", redact("api_key=not-secret"))
+
+    def test_system_tray_is_disabled_in_wsl(self):
+        with (
+            patch.dict(os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}, clear=True),
+            patch("src.desktop.app.sys.platform", "linux"),
+            patch("src.desktop.app.platform.release", return_value="6.6.0-microsoft-standard-WSL2"),
+        ):
+            self.assertFalse(system_tray_supported())
+
+    def test_system_tray_can_be_disabled_explicitly(self):
+        with patch.dict(os.environ, {"ANGELA_DISABLE_TRAY": "true"}, clear=True):
+            self.assertFalse(system_tray_supported())
 
 
 if __name__ == "__main__":
