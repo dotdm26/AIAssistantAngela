@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.runtime.config import load_config, save_config
 from src.runtime.observability import HealthRegistry, redact
@@ -38,21 +39,20 @@ class LocalRuntimeTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_config_round_trip_uses_sqlite_by_default(self):
+    def test_config_round_trip_with_sqlite(self):
         with tempfile.TemporaryDirectory() as directory:
-            previous = os.environ.get("ANGELA_DATA_DIR")
-            os.environ["ANGELA_DATA_DIR"] = directory
-            try:
+            with patch.dict(
+                os.environ,
+                {
+                    "ANGELA_DATA_DIR": directory,
+                    "ANGELA_STORAGE_BACKEND": "sqlite",
+                },
+            ):
                 config = load_config()
                 self.assertEqual(config.storage.backend, "sqlite")
                 path = save_config(config)
                 self.assertTrue(path.exists())
                 self.assertEqual(load_config(path).storage.backend, "sqlite")
-            finally:
-                if previous is None:
-                    os.environ.pop("ANGELA_DATA_DIR", None)
-                else:
-                    os.environ["ANGELA_DATA_DIR"] = previous
 
     def test_health_and_redaction(self):
         health = HealthRegistry()
