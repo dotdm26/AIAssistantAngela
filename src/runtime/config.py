@@ -16,6 +16,8 @@ from typing import Any
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+from src.runtime.migrations import CURRENT_CONFIG_SCHEMA, migrate_config_data
+
 
 def default_data_dir() -> Path:
     configured = os.getenv("ANGELA_DATA_DIR")
@@ -54,6 +56,7 @@ class StorageConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
+    schema_version: int = CURRENT_CONFIG_SCHEMA
     data_dir: Path = Field(default_factory=default_data_dir)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -106,7 +109,9 @@ def load_config(path: Path | None = None) -> AppConfig:
             loaded = json.load(config_file)
         if not isinstance(loaded, dict):
             raise ValueError(f"Angela configuration must be a JSON object: {config_path}")
-        data = loaded
+        data, migrated = migrate_config_data(loaded)
+    else:
+        migrated = False
 
     llm = dict(data.get("llm") or {})
     discord = dict(data.get("discord") or {})
@@ -150,7 +155,10 @@ def load_config(path: Path | None = None) -> AppConfig:
         if field_name not in data and os.getenv(env_name) is not None:
             data[field_name] = cast(os.environ[env_name])
 
-    return AppConfig.model_validate(data)
+    config = AppConfig.model_validate(data)
+    if migrated:
+        save_config(config)
+    return config
 
 
 def save_config(config: AppConfig) -> Path:

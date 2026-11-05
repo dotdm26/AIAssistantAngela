@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -6,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.desktop.app import system_tray_supported
-from src.runtime.config import AppConfig, load_config, save_config
+from src.runtime.backup import backup_data, restore_data
+from src.runtime.config import AppConfig, default_data_dir, load_config, save_config
 from src.runtime.discord_adapter import DiscordAdapter
 from src.runtime.observability import HealthRegistry, redact
 from src.storage.sqlite_store import SQLiteConversationStore
@@ -83,6 +85,67 @@ class LocalRuntimeTests(unittest.TestCase):
 
         self.assertEqual(adapter.client.on_ready, adapter.on_ready)
         self.assertEqual(adapter.client.on_message, adapter.on_message)
+
+    def test_legacy_config_is_migrated_and_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "channel_id": "123",
+                        "database_url": "postgresql://example.invalid/angela",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"ANGELA_STORAGE_BACKEND": "sqlite"}, clear=False):
+                config = load_config(config_path)
+
+            self.assertEqual(config.schema_version, 1)
+            self.assertEqual(config.discord.channel_id, "123")
+            self.assertEqual(config.storage.backend, "postgres")
+            persisted = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["schema_version"], 1)
+            self.assertNotIn("database_url", persisted)
+
+    def test_windows_default_data_dir_uses_localappdata(self):
+        with (
+            patch("src.runtime.config.sys.platform", "win32"),
+            patch.dict(os.environ, {"LOCALAPPDATA": "C:\\Users\\Angela"}, clear=True),
+        ):
+            self.assertEqual(str(default_data_dir()), "C:\\Users\\Angela/Angela")
+
+    def test_backup_and_restore_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            restored = root / "restored"
+            config = AppConfig(data_dir=source)
+            save_config(config)
+            store = SQLiteConversationStore(
+                config.sqlite_path,
+                embedding_dim=3,
+                local_embedding_model="test-model",
+                hybrid_exclude_recent_count=0,
+            )
+            store.save_conversation("user-1", "Remember purple", "I will remember purple", [1.0, 0.0, 0.0])
+            store.close()
+
+            archive = backup_data(config, root / "angela-backup.zip")
+            restore_data(archive, restored)
+            restored_config = load_config(restored / "config.json")
+            restored_store = SQLiteConversationStore(
+                restored_config.sqlite_path,
+                embedding_dim=3,
+                local_embedding_model="test-model",
+                hybrid_exclude_recent_count=0,
+            )
+            history = asyncio.run(restored_store.get_conversation_history("user-1"))
+            restored_store.close()
+
+            self.assertEqual(len(history), 2)
+            self.assertEqual(history[0].content, "Remember purple")
+            self.assertNotIn(b"DISCORD_TOKEN", archive.read_bytes())
 
 
 if __name__ == "__main__":

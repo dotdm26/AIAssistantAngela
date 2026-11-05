@@ -31,7 +31,12 @@ class SetupWizard(tk.Toplevel):
         )
         ttk.Label(
             body,
-            text="Credentials are stored using the operating system credential manager.",
+            text=(
+                f"Credentials are stored using {secrets.storage_description}."
+                if secrets.is_writable
+                else "This environment cannot save credentials. Set DISCORD_TOKEN and "
+                "GOOGLE_API_KEY in .env, then leave these fields blank."
+            ),
             wraplength=420,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 14))
 
@@ -69,6 +74,13 @@ class SetupWizard(tk.Toplevel):
 
     def _save(self):
         try:
+            if (
+                not self.secrets.is_writable
+                and (self.discord_token.get().strip() or self.google_api_key.get().strip())
+            ):
+                raise RuntimeError(
+                    "Credentials cannot be written in this environment. Set them in .env instead."
+                )
             if self.discord_token.get().strip():
                 self.secrets.set("discord_token", self.discord_token.get().strip())
             if self.google_api_key.get().strip():

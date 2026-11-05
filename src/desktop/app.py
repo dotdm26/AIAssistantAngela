@@ -24,6 +24,15 @@ from src.runtime.secrets import get_secret_store
 from src.desktop.setup_wizard import SetupWizard
 
 
+def worker_command() -> tuple[list[str], Path]:
+    """Return the worker command and its working directory for dev/frozen modes."""
+    if getattr(sys, "frozen", False):
+        executable_directory = Path(sys.executable).resolve().parent
+        return [str(executable_directory / "Angela-worker.exe"), "--worker"], executable_directory
+    project_root = Path(__file__).resolve().parents[2]
+    return [sys.executable, "-m", "src.launcher", "--worker"], project_root
+
+
 def system_tray_supported() -> bool:
     """Return whether starting a desktop tray icon is appropriate."""
     if os.getenv("ANGELA_DISABLE_TRAY", "").strip().lower() in {"1", "true", "yes", "on"}:
@@ -121,11 +130,11 @@ class AngelaDesktopApp:
     def start_worker(self):
         if self.worker and self.worker.poll() is None:
             return
-        root_dir = Path(__file__).resolve().parents[2]
+        command, root_dir = worker_command()
         worker_environment = os.environ.copy()
         worker_environment["ANGELA_DESKTOP"] = "1"
         self.worker = subprocess.Popen(
-            [sys.executable, "-m", "src.runtime.worker"],
+            command,
             cwd=root_dir,
             env=worker_environment,
             stdout=subprocess.PIPE,

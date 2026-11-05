@@ -19,7 +19,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 
 class SQLiteConversationStore:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -49,53 +49,90 @@ class SQLiteConversationStore:
 
     def _migrate(self) -> None:
         with self._lock:
-            self._connection.executescript(
+            self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     version INTEGER PRIMARY KEY,
                     applied_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS conversations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    user_message TEXT NOT NULL,
-                    agent_response TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    embedding_json TEXT,
-                    embedding_model TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS conversations_session_created_idx
-                    ON conversations(session_id, created_at DESC);
-
-                CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
-                    user_message,
-                    agent_response,
-                    content='conversations',
-                    content_rowid='id'
-                );
-
-                CREATE TRIGGER IF NOT EXISTS conversations_ai AFTER INSERT ON conversations BEGIN
-                    INSERT INTO conversations_fts(rowid, user_message, agent_response)
-                    VALUES (new.id, new.user_message, new.agent_response);
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS conversations_ad AFTER DELETE ON conversations BEGIN
-                    INSERT INTO conversations_fts(conversations_fts, rowid, user_message, agent_response)
-                    VALUES ('delete', old.id, old.user_message, old.agent_response);
-                END;
+                )
                 """
             )
-            applied = self._connection.execute(
-                "SELECT version FROM schema_migrations WHERE version = ?",
-                (self.SCHEMA_VERSION,),
-            ).fetchone()
-            if not applied:
-                self._connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (self.SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
-                )
+            migrations = {
+                1: self._migration_1,
+                2: self._migration_2,
+            }
+            for version, migration in migrations.items():
+                applied = self._connection.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version = ?",
+                    (version,),
+                ).fetchone()
+                if applied:
+                    continue
+                with self._connection:
+                    migration()
+                    self._connection.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (version, datetime.now(timezone.utc).isoformat()),
+                    )
+
+            self._connection.execute(
+                "INSERT OR REPLACE INTO app_metadata(key, value) VALUES (?, ?)",
+                ("embedding_model", self.local_embedding_model),
+            )
+            self._connection.execute(
+                "INSERT OR REPLACE INTO app_metadata(key, value) VALUES (?, ?)",
+                ("embedding_dimension", str(self.embedding_dim)),
+            )
+
+    def _migration_1(self) -> None:
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                user_message TEXT NOT NULL,
+                agent_response TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                embedding_json TEXT,
+                embedding_model TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS conversations_session_created_idx
+                ON conversations(session_id, created_at DESC);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
+                user_message,
+                agent_response,
+                content='conversations',
+                content_rowid='id'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS conversations_ai AFTER INSERT ON conversations BEGIN
+                INSERT INTO conversations_fts(rowid, user_message, agent_response)
+                VALUES (new.id, new.user_message, new.agent_response);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS conversations_ad AFTER DELETE ON conversations BEGIN
+                INSERT INTO conversations_fts(conversations_fts, rowid, user_message, agent_response)
+                VALUES ('delete', old.id, old.user_message, old.agent_response);
+            END;
+            """
+        )
+
+    def _migration_2(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+
+    def metadata(self) -> dict[str, str]:
+        with self._lock:
+            rows = self._connection.execute("SELECT key, value FROM app_metadata").fetchall()
+        return {row["key"]: row["value"] for row in rows}
 
     async def hybrid_search_conversations(
         self,

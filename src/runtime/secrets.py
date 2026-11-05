@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from abc import ABC, abstractmethod
 
 
@@ -18,6 +19,14 @@ class SecretStore(ABC):
     @abstractmethod
     def delete(self, name: str) -> None:
         raise NotImplementedError
+
+    @property
+    def is_writable(self) -> bool:
+        return False
+
+    @property
+    def storage_description(self) -> str:
+        return "environment variables"
 
 
 _ENV_NAMES = {
@@ -35,6 +44,9 @@ class KeyringSecretStore(SecretStore):
             raise RuntimeError("The keyring package is required for desktop secret storage.") from exc
         self._keyring = keyring
         self.service_name = service_name
+        backend = keyring.get_keyring()
+        if getattr(backend, "priority", 0) <= 0:
+            raise RuntimeError("No usable operating-system credential manager is available.")
 
     def get(self, name: str) -> str | None:
         try:
@@ -57,6 +69,18 @@ class KeyringSecretStore(SecretStore):
             self._keyring.delete_password(self.service_name, name)
         except self._keyring.errors.KeyringError:
             pass
+
+    @property
+    def is_writable(self) -> bool:
+        return True
+
+    @property
+    def storage_description(self) -> str:
+        if sys.platform == "win32":
+            return "Windows Credential Manager"
+        if sys.platform == "darwin":
+            return "macOS Keychain"
+        return "the operating-system credential manager"
 
 
 class EnvironmentSecretStore(SecretStore):
