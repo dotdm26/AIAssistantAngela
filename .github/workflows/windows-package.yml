@@ -1,0 +1,57 @@
+name: Windows package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress --yes
+
+      - name: Run runtime tests
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m unittest discover -s tests -v
+
+      - name: Build installer
+        shell: powershell
+        run: .\scripts\build_windows.ps1
+
+      - name: Run packaged smoke checks
+        shell: powershell
+        run: |
+          $gui = "dist\Angela\Angela.exe"
+          $worker = "dist\Angela\Angela-worker.exe"
+          if (-not (Test-Path $gui) -or -not (Test-Path $worker)) {
+            throw "PyInstaller did not create both executables."
+          }
+          $version = & $gui --version
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($version)) {
+            throw "GUI version smoke check failed."
+          }
+          & $worker --help
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: angela-windows-installer
+          path: dist/installer/*.exe
+          if-no-files-found: error

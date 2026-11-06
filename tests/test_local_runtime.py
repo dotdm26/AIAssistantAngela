@@ -6,12 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from src.agent import ToolFilter
 from src.desktop.app import system_tray_supported
 from src.runtime.backup import backup_data, restore_data
 from src.runtime.config import AppConfig, default_data_dir, load_config, save_config
 from src.runtime.discord_adapter import DiscordAdapter
 from src.runtime.observability import HealthRegistry, redact
 from src.storage.sqlite_store import SQLiteConversationStore
+from src.utils.embeddings import cosine_similarity
 
 
 class LocalRuntimeTests(unittest.TestCase):
@@ -63,6 +65,22 @@ class LocalRuntimeTests(unittest.TestCase):
         health.update("database", "ready", "sqlite")
         self.assertEqual(health.snapshot()[0]["state"], "ready")
         self.assertNotIn("not-secret", redact("api_key=not-secret"))
+
+    def test_embedding_math_and_backend_defaults(self):
+        self.assertAlmostEqual(cosine_similarity([1.0, 0.0], [1.0, 0.0]), 1.0)
+        self.assertEqual(AppConfig().memory.backend, "sentence-transformers")
+
+    def test_tool_filter_can_use_shared_embedding_provider(self):
+        class FakeEmbeddingProvider:
+            def embed_document(self, text):
+                return [1.0, 0.0]
+
+            def embed_query(self, text):
+                return [1.0, 0.0]
+
+        tool_filter = ToolFilter(FakeEmbeddingProvider())
+        selected = tool_filter.get_relevant_tools("search the web", max_rounds=2)
+        self.assertEqual(len(selected), 2)
 
     def test_system_tray_is_disabled_in_wsl(self):
         with (

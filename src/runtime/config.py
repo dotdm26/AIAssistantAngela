@@ -46,8 +46,10 @@ class DiscordConfig(BaseModel):
 
 
 class MemoryConfig(BaseModel):
+    backend: str = "sentence-transformers"
     history_limit: int = 10
     embedding_model: str = "nomic-ai/nomic-embed-text-v1.5"
+    model_path: str | None = None
 
 
 class StorageConfig(BaseModel):
@@ -127,7 +129,9 @@ def load_config(path: Path | None = None) -> AppConfig:
         [value for value in (_env_or_none("user1"), _env_or_none("user2")) if value],
     )
     memory.setdefault("history_limit", int(os.getenv("HISTORY_LIMIT", "10")))
+    memory.setdefault("backend", os.getenv("EMBEDDING_BACKEND", "sentence-transformers"))
     memory.setdefault("embedding_model", os.getenv("LOCAL_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5"))
+    memory.setdefault("model_path", _env_or_none("EMBEDDING_MODEL_PATH"))
     storage.setdefault(
         "backend",
         os.getenv("ANGELA_STORAGE_BACKEND", "postgres" if os.getenv("DATABASE_URL") else "sqlite"),

@@ -7,11 +7,12 @@ from src.storage.sqlite_store import SQLiteConversationStore
 
 
 def create_conversation_store(config: AppConfig, embedding_dim: int):
+    embedding_identifier = config.memory.model_path or config.memory.embedding_model
     if config.storage.backend == "sqlite":
         return SQLiteConversationStore(
             database_path=config.sqlite_path,
             embedding_dim=embedding_dim,
-            local_embedding_model=config.memory.embedding_model,
+            local_embedding_model=embedding_identifier,
             hybrid_exclude_recent_count=config.hybrid_exclude_recent_count,
             rag_half_life_days=config.rag_half_life_days,
         )
@@ -25,7 +26,7 @@ def create_conversation_store(config: AppConfig, embedding_dim: int):
     return ConversationStore(
         database_url=config.storage.database_url,
         embedding_dim=embedding_dim,
-        local_embedding_model=config.memory.embedding_model,
+        local_embedding_model=embedding_identifier,
         hybrid_exclude_recent_count=config.hybrid_exclude_recent_count,
         rag_half_life_days=config.rag_half_life_days,
     )

@@ -22,6 +22,7 @@ collect_hidden_imports = [
     "src.runtime.worker",
     "src.storage.factory",
     "src.storage.sqlite_store",
+    "sentence_transformers",
     "keyring.backends.Windows",
     "pystray._win32",
 ]

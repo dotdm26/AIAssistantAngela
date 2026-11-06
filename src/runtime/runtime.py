@@ -50,7 +50,8 @@ class AngelaRuntime:
         try:
             self.agent = AIAgent(config=self.config, secret_store=self.secrets)
             self.health.update("database", "ready", self.config.storage.backend)
-            self.health.update("memory", "ready", self.config.memory.embedding_model)
+            memory_identifier = self.config.memory.model_path or self.config.memory.embedding_model
+            self.health.update("memory", "ready", f"{self.config.memory.backend}: {memory_identifier}")
         except Exception as exc:
             self.health.update("database", "failed", str(exc))
             self.logger.exception("Failed to initialize Angela")

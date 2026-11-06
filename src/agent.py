@@ -7,7 +7,6 @@ from typing import List, Union, Optional
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from sentence_transformers import SentenceTransformer, util
 from src.utils.config import (
     GOOGLE_API_KEY,
     LOCAL_EMBEDDING_MODEL,
@@ -28,7 +27,7 @@ from src.conversation_store import ConversationStore
 from src.runtime.config import AppConfig, load_config
 from src.runtime.secrets import SecretStore, get_secret_store
 from src.storage.factory import create_conversation_store
-from src.utils.embeddings import LocalNomicEmbeddings, detect_embedding_dimension
+from src.utils.embeddings import cosine_similarity, create_embedding_provider, detect_embedding_dimension
 from src.utils.prompts import build_system_prompt, configure_formatting
 from src.utils.trackers import (
     estimate_token_count,
@@ -216,11 +215,12 @@ class AIAgent:
         self.llm_gmail_label = self.llm.bind_tools(gmail_label_tools_list)
         self.llm_gmail_write = self.llm.bind_tools(gmail_write_tools_list)
         self.llm_web_search = self.llm.bind_tools(web_search_tools)
-        self.tool_filter = ToolFilter()
         self._bound_tools_cache = {}
         embedding_model = self.runtime_config.memory.embedding_model or LOCAL_EMBEDDING_MODEL
-        self.embeddings = LocalNomicEmbeddings(model_name=embedding_model)
+        self.runtime_config.memory.embedding_model = embedding_model
+        self.embeddings = create_embedding_provider(self.runtime_config.memory)
         self.embedding_dim = detect_embedding_dimension(self.embeddings)
+        self.tool_filter = ToolFilter(self.embeddings)
         self.conversation_history = {}
         self.tools_by_name = {**general_tool_names, **calendar_tool_names, **gmail_tool_names, **web_search_tool_names}
 
@@ -650,11 +650,13 @@ class AIAgent:
 class ToolFilter:
     """Filter to determine if a tool should be invoked based on the prompt."""
 
-    def __init__(self):
-        self.llm = SentenceTransformer("all-MiniLM-L6-v2")
-
+    def __init__(self, embedding_provider):
+        self.embedding_provider = embedding_provider
         self.tool_library = tools_list
-        self.tool_embeddings = self.llm.encode([tool.description for tool in self.tool_library], convert_to_tensor=True)
+        self.tool_embeddings = [
+            self.embedding_provider.embed_document(tool.description)
+            for tool in self.tool_library
+        ]
 
     def has_tool_intent(self, prompt: str) -> bool:
         text = _extract_text(prompt).strip().lower()
@@ -664,7 +666,7 @@ class ToolFilter:
         return bool(TOOL_INTENT_RE.search(text))
 
     def embed_prompt(self, prompt: str):
-        return self.llm.encode(prompt, convert_to_tensor=True)
+        return self.embedding_provider.embed_query(prompt)
 
     def should_invoke_with_tools(self, prompt: str, min_score: float, prompt_embedding=None) -> bool:
         """Route to tool-bound model only when intent and relevance both indicate tool use."""
@@ -752,10 +754,10 @@ class ToolFilter:
         """Filter tools based on the prompt."""
         if prompt_embedding is None:
             prompt_embedding = self.embed_prompt(prompt)
-        cosine_scores = util.cos_sim(prompt_embedding, self.tool_embeddings)[0]
+        cosine_scores = [cosine_similarity(prompt_embedding, embedding) for embedding in self.tool_embeddings]
         k = max(1, min(max_rounds, len(self.tool_library)))
-        top_tools = cosine_scores.topk(k)
-        return [self.tool_library[i] for i in top_tools.indices]
+        top_indices = sorted(range(len(cosine_scores)), key=cosine_scores.__getitem__, reverse=True)[:k]
+        return [self.tool_library[index] for index in top_indices]
 
     def get_top_score(self, prompt, prompt_embedding=None) -> float:
         """Return top cosine similarity between prompt and tool descriptions."""
@@ -764,8 +766,8 @@ class ToolFilter:
 
         if prompt_embedding is None:
             prompt_embedding = self.embed_prompt(prompt)
-        cosine_scores = util.cos_sim(prompt_embedding, self.tool_embeddings)[0]
-        return float(cosine_scores.max().item())
+        cosine_scores = [cosine_similarity(prompt_embedding, embedding) for embedding in self.tool_embeddings]
+        return float(max(cosine_scores, default=0.0))
 
     def get_relevant_tool_names(self, prompt, max_rounds: int = MAX_TOOL_ROUNDS):
         """Filter tools based on the prompt."""

@@ -1,0 +1,5 @@
+# Build-only dependencies for exporting and quantizing an embedding model.
+-r requirements-onnx.txt
+onnx>=1.16,<2
+optimum[onnxruntime]>=1.23,<3
+transformers>=4.40,<6

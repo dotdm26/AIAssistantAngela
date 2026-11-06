@@ -79,3 +79,28 @@ with:
 The script verifies that application files install, the worker can create a
 backup, upgrades preserve a user-data sentinel, and uninstallation removes
 application files without deleting `%LOCALAPPDATA%\Angela`.
+
+## Optional compact ONNX profile
+
+The default profile keeps the existing Sentence Transformers backend for
+compatibility. To create a smaller CPU-only embedding artifact, install the
+export dependencies and run:
+
+```powershell
+python -m pip install -r requirements-onnx-build.txt
+python scripts\export_onnx_model.py `
+  --model nomic-ai/nomic-embed-text-v1.5 `
+  --output models\nomic-ai-nomic-embed-text-v1.5
+```
+
+Then configure the local runtime with:
+
+```dotenv
+EMBEDDING_BACKEND="onnx"
+EMBEDDING_MODEL_PATH="models/nomic-ai-nomic-embed-text-v1.5"
+```
+
+The exporter writes an INT8 `model.int8.onnx` file and a SHA-256 manifest.
+Benchmark its retrieval quality and startup/memory usage against the default
+backend before making it the installer default. Existing conversation vectors
+must be rebuilt when changing embedding models.
