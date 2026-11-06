@@ -62,6 +62,23 @@ class LocalRuntimeTests(unittest.TestCase):
                 self.assertTrue(path.exists())
                 self.assertEqual(load_config(path).storage.backend, "sqlite")
 
+    def test_embedding_environment_overrides_saved_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = AppConfig(data_dir=Path(directory))
+            path = save_config(config)
+            with patch.dict(
+                os.environ,
+                {
+                    "EMBEDDING_BACKEND": "onnx",
+                    "EMBEDDING_MODEL_PATH": "/models/minilm",
+                },
+                clear=False,
+            ):
+                loaded = load_config(path)
+
+            self.assertEqual(loaded.memory.backend, "onnx")
+            self.assertEqual(loaded.memory.model_path, "/models/minilm")
+
     def test_health_and_redaction(self):
         health = HealthRegistry()
         health.update("database", "ready", "sqlite")

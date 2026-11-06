@@ -132,6 +132,12 @@ def load_config(path: Path | None = None) -> AppConfig:
     memory.setdefault("backend", os.getenv("EMBEDDING_BACKEND", "sentence-transformers"))
     memory.setdefault("embedding_model", os.getenv("LOCAL_EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5"))
     memory.setdefault("model_path", _env_or_none("EMBEDDING_MODEL_PATH"))
+    if os.getenv("EMBEDDING_BACKEND") is not None:
+        memory["backend"] = os.environ["EMBEDDING_BACKEND"]
+    if os.getenv("LOCAL_EMBEDDING_MODEL") is not None:
+        memory["embedding_model"] = os.environ["LOCAL_EMBEDDING_MODEL"]
+    if os.getenv("EMBEDDING_MODEL_PATH") is not None:
+        memory["model_path"] = _env_or_none("EMBEDDING_MODEL_PATH")
     storage.setdefault(
         "backend",
         os.getenv("ANGELA_STORAGE_BACKEND", "postgres" if os.getenv("DATABASE_URL") else "sqlite"),
