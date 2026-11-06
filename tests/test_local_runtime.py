@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +15,7 @@ from src.runtime.config import AppConfig, default_data_dir, load_config, save_co
 from src.runtime.discord_adapter import DiscordAdapter
 from src.runtime.observability import HealthRegistry, redact
 from src.storage.sqlite_store import SQLiteConversationStore
-from src.utils.embeddings import cosine_similarity
+from src.utils.embeddings import OnnxEmbeddings, cosine_similarity
 
 
 class LocalRuntimeTests(unittest.TestCase):
@@ -81,6 +83,68 @@ class LocalRuntimeTests(unittest.TestCase):
         tool_filter = ToolFilter(FakeEmbeddingProvider())
         selected = tool_filter.get_relevant_tools("search the web", max_rounds=2)
         self.assertEqual(len(selected), 2)
+
+    def test_onnx_provider_reads_manifest_settings(self):
+        class FakeTokenizer:
+            instance = None
+
+            def __init__(self):
+                self.max_length = None
+                self.last_text = None
+                FakeTokenizer.instance = self
+
+            @classmethod
+            def from_file(cls, _path):
+                return cls()
+
+            def enable_truncation(self, *, max_length):
+                self.max_length = max_length
+
+            def encode(self, text):
+                self.last_text = text
+                return types.SimpleNamespace(ids=[1, 2], attention_mask=[1, 1])
+
+        class FakeSession:
+            def __init__(self, _path, *, providers):
+                self.providers = providers
+
+            def get_inputs(self):
+                return [
+                    types.SimpleNamespace(name="input_ids", type="tensor(int64)"),
+                    types.SimpleNamespace(name="attention_mask", type="tensor(int64)"),
+                ]
+
+            def run(self, _output_names, _input_values):
+                return [[[[1.0, 0.0], [1.0, 0.0]]][0]]
+
+        onnxruntime = types.ModuleType("onnxruntime")
+        onnxruntime.InferenceSession = FakeSession
+        tokenizers = types.ModuleType("tokenizers")
+        tokenizers.Tokenizer = FakeTokenizer
+
+        with tempfile.TemporaryDirectory() as directory:
+            model_directory = Path(directory)
+            (model_directory / "model.int8.onnx").write_bytes(b"test")
+            (model_directory / "tokenizer.json").write_text("{}", encoding="utf-8")
+            (model_directory / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+                        "query_prefix": "",
+                        "document_prefix": "passage: ",
+                        "max_length": 128,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(sys.modules, {"onnxruntime": onnxruntime, "tokenizers": tokenizers}):
+                provider = OnnxEmbeddings(model_directory)
+                vector = provider.embed_document("example")
+
+        self.assertEqual(FakeTokenizer.instance.max_length, 128)
+        self.assertEqual(FakeTokenizer.instance.last_text, "passage: example")
+        self.assertEqual(vector, [1.0, 0.0])
 
     def test_system_tray_is_disabled_in_wsl(self):
         with (

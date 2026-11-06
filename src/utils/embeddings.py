@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 from pathlib import Path
 from typing import Any, List
@@ -69,11 +70,27 @@ class OnnxEmbeddings:
         self.model_name = str(self.model_path)
         self._np = np
         self.tokenizer = Tokenizer.from_file(str(tokenizer_file))
+        manifest_file = self.model_path / "manifest.json"
+        manifest: dict[str, Any] = {}
+        if manifest_file.exists():
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        model_name = str(manifest.get("model_name", ""))
+        legacy_nomic_prefixes = "nomic" in model_name.lower()
+        self.query_prefix = str(
+            manifest.get("query_prefix", "search_query: " if legacy_nomic_prefixes else "")
+        )
+        self.document_prefix = str(
+            manifest.get("document_prefix", "search_document: " if legacy_nomic_prefixes else "")
+        )
+        self.max_length = int(manifest.get("max_length", 256))
+        if self.max_length <= 0:
+            raise ValueError("ONNX embedding max_length must be greater than zero")
+        self.tokenizer.enable_truncation(max_length=self.max_length)
         self.session = ort.InferenceSession(str(model_file), providers=["CPUExecutionProvider"])
         self.inputs = {item.name: item for item in self.session.get_inputs()}
 
     def _encode(self, text: str, prefix: str) -> List[float]:
-        encoding = self.tokenizer.encode(f"{prefix}: {text}")
+        encoding = self.tokenizer.encode(f"{prefix}{text}")
         input_values: dict[str, Any] = {}
         for name, metadata in self.inputs.items():
             if name == "input_ids":
@@ -102,10 +119,10 @@ class OnnxEmbeddings:
         return vector.tolist()
 
     def embed_query(self, text: str) -> List[float]:
-        return self._encode(text, "search_query")
+        return self._encode(text, self.query_prefix)
 
     def embed_document(self, text: str) -> List[float]:
-        return self._encode(text, "search_document")
+        return self._encode(text, self.document_prefix)
 
     async def aembed_query(self, text: str) -> List[float]:
         return await asyncio.to_thread(self.embed_query, text)

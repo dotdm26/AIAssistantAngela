@@ -89,16 +89,21 @@ export dependencies and run:
 ```powershell
 python -m pip install -r requirements-onnx-build.txt
 python scripts\export_onnx_model.py `
-  --model nomic-ai/nomic-embed-text-v1.5 `
-  --output models\nomic-ai-nomic-embed-text-v1.5
+  --output models\all-MiniLM-L6-v2
 ```
 
 Then configure the local runtime with:
 
 ```dotenv
 EMBEDDING_BACKEND="onnx"
-EMBEDDING_MODEL_PATH="models/nomic-ai-nomic-embed-text-v1.5"
+EMBEDDING_MODEL_PATH="models/all-MiniLM-L6-v2"
 ```
+
+The exporter defaults to `sentence-transformers/all-MiniLM-L6-v2`, a compact
+architecture supported by Optimum's ONNX exporter. Nomic Embed v1.5 uses the
+custom `nomic_bert` architecture and cannot be exported by this generic path;
+continue using it through the default Sentence Transformers backend unless a
+compatible pre-converted ONNX artifact is supplied.
 
 The exporter writes an INT8 `model.int8.onnx` file and a SHA-256 manifest.
 Benchmark its retrieval quality and startup/memory usage against the default
